@@ -1,5 +1,8 @@
+.env
 __pycache__/
 *.pyc
-.env
+*.pyo
 *.db
+*.db-shm
+*.db-wal
 .DS_Store

@@ -1,74 +1,140 @@
-# Crypto Strategy Lab
+# AI Crypto Strategy Lab
 
-一套可直接部署到 Zeabur 的多策略加密貨幣研究、掃描、紙上交易與安全調參平台。預設 **不會真實下單**。每個策略都有獨立 10,000 USDT 模擬帳戶、獨立進場模型、止損、三段止盈、移動止損、交易紀錄、每日勝率/PnL 與調整紀錄。
+最終用途：長時間掃描 Bitget USDT 永續合約市場，用多套互相獨立的策略做真實行情 paper trading，讓每套策略在硬風控邊界內持續測試、調整與淘汰，只有通過長期 forward evidence 的策略才會自動取得 `FINAL / live_eligible`，之後仍必須由操作員在網頁手動打開 LIVE 總開關，才可能送出 Bitget 真實訂單。
 
-## 內建 9 個策略
+> 任何策略都不保證獲利。這個系統的設計目標是降低過度最佳化、短期運氣與統計污染，並把真實資金權限和研究權限分離。
 
-1. **SMC Liquidity Reversal**：swing liquidity sweep + reclaim + CHoCH/BOS；結構外加 ATR buffer 停損。
-2. **OI Trend Expansion**：20-bar breakout + 30m OI expansion + relative volume + ADX；避免只看 OI 單一訊號。
-3. **Funding Squeeze Reversal**：極端 funding + OI expansion + RSI/exhaustion；做 crowded positioning 反轉。
-4. **Volume Compression Breakout**：區間壓縮後異常相對成交量突破。
-5. **Fibonacci Pullback**：1H impulse + 0.50–0.618 pullback + 15m confirmation；0.786/structure 外止損。
-6. **VWAP / EMA Momentum**：1H trend + 15m VWAP retest/reclaim + EMA alignment。
-7. **Mean Reversion**：只在低 ADX regime 使用 z-score + RSI，避免拿均值回歸硬扛趨勢。
-8. **Orderbook Imbalance**：Bitget 深度買賣盤失衡 + spread + volume/trend filter。
-9. **CoinGlass Liquidation Magnet**：CoinGlass liquidation heatmap 找主要清算密集區，再用結構方向確認；沒有 CoinGlass key 時策略自動無訊號，不會亂用假資料。
+## 內建策略
 
-## 三階段與「不學歪」設計
+1. SMC 流動性反轉：swing liquidity sweep + reclaim + CHoCH/BOS。
+2. OI 趨勢擴張：價格突破 + Bitget OI + CoinGlass 全市場 OI + RVOL + ADX。
+3. Funding 擠壓反轉：極端 funding + OI + RSI/exhaustion。
+4. 量能壓縮突破：range compression + abnormal relative volume breakout。
+5. Fibonacci 回踩：1H impulse + 0.50–0.618 retracement + 15m confirmation。
+6. VWAP / EMA 動能：1H trend + 15m VWAP reclaim/rejection + EMA alignment。
+7. 區間均值回歸：低 ADX regime + z-score + RSI。
+8. 訂單簿失衡：Bitget L2 depth imbalance + spread + momentum。
+9. CoinGlass 清算磁鐵：liquidation heatmap cluster + market structure。
 
-### EARLY — 初期激進紙上測試
-- 每筆風險約 1.5%（個別較反轉/微結構策略更低）。
-- 允許較多樣本，目的不是宣告獲利，而是收集 forward paper evidence。
-- 最多 4 個同策略同時持倉，paper notional 有 3x equity cap。
+每套策略 Champion 都有獨立 `10,000 USDT` paper account。Challenger 是額外影子帳戶，只用來驗證新參數，不會混入 Champion 的績效。
 
-### TUNING — 中期調整
-- 80+ 筆**完整 round-trip** paper trades、至少 14 天、正 expectancy、PF >= 1.05、最大回撤 <= 18%，且多個時間窗不能只靠單一時段賺錢才會升級。
-- 每次學習最多只改 **一個參數**，且只在預先設定的合理 bounds 中移動約 5% 範圍。
-- 每 24 小時最多調整一次，不會每輸一單就亂改。
-- 所有 before / after / reason 都寫進 `adjustments`。
+## 不是「輸一單就亂改」：Champion / Challenger
 
-### FINAL — 最後測試完成
-- 200+ **完整 round-trip** paper trades、至少 45 天、PF >= 1.20、positive expectancy、Sharpe-like >= 0.8、最大回撤 <= 12%、至少 75% rolling windows 為正，才會自動標記 FINAL。
-- FINAL 還要求把交易成本再加壓後仍為正（stressed PF >= 1.05），且單一幣種不能貢獻超過 40% 的正收益，降低「其實只靠某一顆幣碰巧賺到」的假 edge。
-- FINAL 只是 `live_eligible=true`，**仍然無法真實下單**。
-- 真實 Bitget 下單還需要人工在 Zeabur 同時設定：`LIVE_TRADING_ENABLED=true` + `FINAL_LIVE_UNLOCK_TOKEN` + Bitget private API credentials。
-- `BitgetLiveAdapter` 程式本身再次檢查 `stage == FINAL`，非 FINAL 直接拒絕。
+機器人每個 learning cycle 最多只提出少量有界變更。候選參數不會直接覆蓋正式策略，而是建立 Challenger，跟 Champion 同時在真實行情上 paper trade。Challenger 至少累積指定筆數與天數，再比較 PF、expectancy、stressed PF、drawdown、R expectancy 等；只有明顯較穩定才 promoted，否則 rejected。
 
-這樣做是刻意避免典型 backtest overfitting：大量嘗試後只留下歷史最漂亮參數，很容易產生假的 Sharpe/PF。此版本採 forward paper evidence、rolling robustness、bounded one-change-at-a-time governor；未來可再加 CSCV / Deflated Sharpe / double out-of-sample，但不應讓 optimizer 直接碰真實資金。
+可學習範圍不只訊號門檻，也包含：
+
+- `risk_pct` 每筆風險比例
+- `leverage` 模擬槓桿
+- `max_positions` 同策略最大同時持倉
+- `max_position_notional_pct` 單筆下單名義金額上限（所以「下多少」本身也在學習）
+- `max_symbol_exposure_pct` 單幣曝險
+- `max_total_exposure_pct` 總曝險
+- `tp1_r / tp2_r / tp3_r`
+- `tp1_fraction / tp2_fraction`
+- `trail_r`
+- 每套策略自己的 OI / volume / ADX / RSI / ATR / Fibo / orderbook / liquidation 等參數
+
+AI 永遠不能突破 `.env` 的 HARD_* 風控 ceiling。升級到 TUNING / FINAL 後，風險與槓桿的 stage cap 也會自動降低。
+
+為避免永遠反覆改參數、永遠累積不到固定版本的 forward evidence，系統有 convergence freeze：當 Champion 已接近下一個升級門檻時，暫停探索一段時間，讓同一組參數累積乾淨的 14/45 天證據；若期限到了仍沒過門檻，再恢復 Challenger 探索。
+
+更重要的是：FINAL 策略若有 Challenger 新參數被 promoted，舊 FINAL/live 資格會立即撤銷，新 Champion 回到 TUNING 並重新累積完整 FINAL evidence。新參數不會繼承舊參數的成績。
+
+## 三階段
+
+### EARLY
+較積極收集 forward samples，但仍受 hard risk limits 限制。
+
+### TUNING
+至少累積足夠完整 round-trip、天數、PF、正 expectancy、可接受回撤與 rolling robustness 才會進入。
+
+### FINAL
+預設要求：
+
+- `FINAL_MIN_TRADES=250`
+- `FINAL_MIN_DAYS=45`
+- PF >= 1.25
+- stressed PF >= 1.10
+- max drawdown <= 10%
+- rolling positive windows >= 75%
+- 正收益不能過度集中單一幣
+- 至少跨 5 個交易幣種
+
+FINAL 之後如果最近 60+ 筆交易明顯退化（例如 PF < 0.95、expectancy < 0、回撤惡化），系統會自動 demote 回 TUNING 並立即撤銷 `live_eligible`。
+
+## 真實交易：三層 Gate
+
+真實 Bitget 訂單必須同時滿足：
+
+1. 策略機器人自動學習完成：`stage == FINAL && live_eligible == true`
+2. Zeabur 部署層允許：`LIVE_TRADING_ALLOWED=true` 且 Bitget private credentials 完整
+3. 你本人在 Dashboard 右上角輸入 `ADMIN_TOKEN` 並手動把 LIVE switch 打開
+
+少一項都不下單。網頁開關狀態存 SQLite runtime settings，重新啟動後仍保留，但 FINAL strategy 若退化會自動失去資格。
+
+Bitget live adapter 還會先扣掉該策略現有真實倉位名義金額，並依 Bitget 帳戶 `available` 可用保證金再做最後一次縮倉，避免 paper 倉位直接照搬造成真實帳戶過度曝險；送單前也會重新抓 ticker，如果 paper 觸發價與真實行情偏離超過 `LIVE_MAX_ENTRY_DRIFT_BPS` 就拒絕追價。接著會讀 `/api/v2/mix/market/contracts`，依 `minTradeNum`、`sizeMultiplier`、`volumePlace`、`minTradeUSDT`、`maxMarketOrderQty`、`maxLever` 正規化數量與槓桿，再送 `/api/v2/mix/order/place-order`。Entry 同時帶預設止損；若 `LIVE_PARTIAL_TP_ENABLED=true`，再用 `/api/v2/mix/order/place-tpsl-order` 建立 TP1 / TP2 / TP3 分批 profit plans。
 
 ## 市場資料
 
-- Bitget Futures public REST：all tickers、15m/1H candles、current OI、funding、orderbook depth。
-- CoinGlass v4：付費 key 可用 liquidation heatmap；只在該策略需要時才呼叫並快取 5 分鐘，避免浪費額度。
-- OI 30m change 由程式自己持續保存 Bitget OI snapshots 算，不依賴外部歷史資料供應商。
-- 掃描先以 24h USDT volume 過濾，再輪轉掃描，不是固定 watchlist。持倉價格管理使用 Bitget batch ticker 每輪刷新。
+- Bitget public V2：tickers、contracts、15m / 1H candles、OI、funding、orderbook depth。
+- CoinGlass V4：pair liquidation heatmap、全市場 exchange-list OI 30m change（有付費 key 才啟用）；可用 `COINGLASS_TOP_SYMBOLS` 控制每輪只對流動性前段幣種做付費資料 enrichment，避免浪費 API 額度。
+- OI 也會在本地持續保存 snapshot，計算 Bitget 自身約 30m OI change。
+- BTC 1H EMA / ADX / ATR 自動判定 `BULL_TREND / BEAR_TREND / RANGE / HIGH_VOL / NEUTRAL`，各策略依適合 regime 決定是否工作。
 
-## 紙上成交模型
+## Dashboard（PORT 8080）
 
-Paper fill 不是用 signal price 當作零成本神成交：預設計入 0.06% taker fee 與 4 bps slippage；TP/SL 出場也計入費用/滑價。TP1 平 30%、TP2 平 35%、TP3/stop 處理剩餘部位；TP1 後 stop 拉到 BE，TP2 後再鎖利並啟用 trailing。
+首頁會顯示：
 
-## Zeabur 部署
+- 掃描狀態 / 幣池 / BTC regime / CoinGlass 狀態
+- 每策略 equity、總報酬、完整交易數、勝率、PF、stress PF、Avg R、DD、rolling robustness
+- EARLY / TUNING / FINAL
+- live eligible 狀態
+- Challenger 正在測什麼、交易數與 PF
+- Champion 當前學到的 risk / leverage / exposure / TP / trailing 參數
+- 模擬持倉、SL / TP1 / TP2 / TP3
+- 每日 PnL / 勝率
+- 所有參數調整 before → after + 原因
+- 風控拒絕原因
+- 真實 Bitget order log
+- LIVE 手動總開關
 
-1. 把整個 repo 上傳 GitHub。
-2. Zeabur 新增 Service → GitHub repository。
-3. Port 使用 `8080`（Zeabur 若注入 `PORT` 也會自動使用）。
-4. 若要保留 SQLite 歷史，掛 persistent volume 到 `/data`；或至少保持 `DB_PATH=/data/crypto_lab.db`。
-5. 複製 `.env.example` 的環境變數。紙上研究階段 Bitget private keys 全部留空。
-6. CoinGlass key 填 `COINGLASS_API_KEY` 即可啟用清算磁鐵策略。
-7. 打開網站首頁就是 dashboard；健康檢查為 `/health`。
+## Zeabur
 
-## Dashboard / API
+1. 直接用此 GitHub repo 建立 Zeabur service。
+2. Port `8080`。
+3. 建立 persistent volume，掛到 `/data`。
+4. 把 `.env.example` 全部環境變數放到 Zeabur。
+5. 初期保持 `LIVE_TRADING_ALLOWED=false`，Bitget private key 可先留空；Bitget public market data 不需要 private key。
+6. 填入 `COINGLASS_API_KEY` 後自動啟用 CoinGlass 資料。
+7. `ADMIN_TOKEN` 請一定使用長亂數字串。
 
-- `/`：策略總覽、Equity、勝率、PF、Expectancy、持倉、最近訊號、每日統計、調整紀錄。
+資料庫預設：`/data/crypto_lab.db`。
+
+## 重要環境變數
+
+完整清單直接看 `.env.example`。不要把真實 `.env` commit 到 GitHub。
+
+## API
+
+- `/health`
 - `/api/overview`
 - `/api/strategies`
 - `/api/positions`
 - `/api/trades`
 - `/api/signals`
-- `/api/adjustments`
 - `/api/daily`
-- `/api/learning/run`：可搭 `ADMIN_TOKEN` 手動觸發一次 governor。
+- `/api/adjustments`
+- `/api/risk-events`
+- `/api/live/status`
+- `/api/live/orders`
+- `POST /api/live/toggle`（需要 `x-admin-token`）
+- `POST /api/learning/run`（需要 `x-admin-token`）
+- `POST /api/strategy/{name}/toggle`（需要 `x-admin-token`）
 
-## 重要限制
+## 執行
 
-任何策略都不能保證「真正會賺錢」。這個專案的目標是把錯誤策略快速淘汰、把資料洩漏/過度最佳化/零成本回測等假象壓低，再用長時間 forward paper results 挑出值得進一步驗證的模型。真實資金啟用前仍應至少再加入：exchange position reconciliation、API idempotency、circuit breaker、最大日損、總 portfolio exposure、停機復原與更完整的交易所 precision/min-size 處理。
+```bash
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8080
+```
