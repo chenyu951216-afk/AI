@@ -6,7 +6,9 @@ from .db import db
 COMMON_BOUNDS={
  "risk_pct":(0.003,0.020),"leverage":(1.0,5.0),"max_positions":(1.0,8.0),
  "max_position_notional_pct":(0.06,0.40),"max_symbol_exposure_pct":(0.08,0.40),"max_total_exposure_pct":(0.35,2.25),
- "tp1_r":(0.55,1.60),"tp2_r":(1.10,3.20),"tp3_r":(1.80,5.50),"tp1_fraction":(0.12,0.48),"tp2_fraction":(0.12,0.48),"trail_r":(0.50,2.60),
+ "sl1_r":(0.30,0.88),"sl1_fraction":(0.08,0.32),
+ "tp1_r":(0.40,1.60),"tp2_r":(0.85,3.20),"tp3_r":(1.40,5.50),"tp1_fraction":(0.12,0.48),"tp2_fraction":(0.12,0.48),
+ "breakeven_trigger_r":(0.45,1.80),"breakeven_offset_r":(0.0,0.30),"trail_start_r":(0.70,3.20),"trail_r":(0.35,2.60),
 }
 STAGE_RISK_CAP={"EARLY":0.020,"TUNING":0.013,"FINAL":0.008}
 STAGE_LEVERAGE_CAP={"EARLY":5.0,"TUNING":3.5,"FINAL":2.5}
@@ -22,11 +24,14 @@ class RiskManager:
         p["max_position_notional_pct"]=min(float(p.get("max_position_notional_pct",.20)),settings.hard_max_symbol_exposure_pct)
         p["max_symbol_exposure_pct"]=min(float(p.get("max_symbol_exposure_pct",.22)),settings.hard_max_symbol_exposure_pct)
         p["max_total_exposure_pct"]=min(float(p.get("max_total_exposure_pct",1.0)),settings.hard_max_total_exposure_pct)
-        p["tp2_r"]=max(float(p.get("tp2_r",1.8)),float(p.get("tp1_r",.9))+.25);p["tp3_r"]=max(float(p.get("tp3_r",3)),p["tp2_r"]+.45)
-        f1=float(p.get("tp1_fraction",.3));f2=float(p.get("tp2_fraction",.35))
-        if f1+f2>.85:
-            z=.85/(f1+f2);f1*=z;f2*=z
-        p["tp1_fraction"]=round(f1,4);p["tp2_fraction"]=round(f2,4);return p
+        p["tp2_r"]=max(float(p.get("tp2_r",1.6)),float(p.get("tp1_r",.8))+.20);p["tp3_r"]=max(float(p.get("tp3_r",2.8)),p["tp2_r"]+.35)
+        p["breakeven_trigger_r"]=max(float(p.get("breakeven_trigger_r",.85)),float(p.get("tp1_r",.8))*.75)
+        p["trail_start_r"]=max(float(p.get("trail_start_r",1.3)),p["breakeven_trigger_r"]+.15)
+        slf=float(p.get("sl1_fraction",.18));f1=float(p.get("tp1_fraction",.25));f2=float(p.get("tp2_fraction",.30))
+        if slf+f1+f2>.86:
+            z=.86/(slf+f1+f2);slf*=z;f1*=z;f2*=z
+        p["sl1_fraction"]=round(slf,4);p["tp1_fraction"]=round(f1,4);p["tp2_fraction"]=round(f2,4)
+        return p
     def equity(self,strategy:str,variant:str,prices:dict[str,float]|None=None)->float:
         acc=db.account(strategy,variant);bal=float(acc["balance"]) if acc else settings.initial_paper_equity;unreal=0.;prices=prices or {}
         for pos in db.query("SELECT * FROM positions WHERE strategy=? AND variant=?",(strategy,variant)):
@@ -60,6 +65,6 @@ class RiskManager:
         return True,"ok"
     def size_and_targets(self,strategy,variant,symbol,side,entry,stop,params,stage,prices=None):
         p=self.sanitize(params,stage);eq=self.equity(strategy,variant,prices);dist=abs(entry-stop);risk=eq*p["risk_pct"];q_r=risk/max(dist,1e-12);q_lev=eq*p["leverage"]/max(entry,1e-12);total,by=self.exposure(strategy,variant,prices);q_total=max(0,eq*p["max_total_exposure_pct"]-total)/max(entry,1e-12);q_sym=max(0,eq*p["max_symbol_exposure_pct"]-by.get(symbol,0))/max(entry,1e-12);q_pos=eq*p["max_position_notional_pct"]/max(entry,1e-12);qty=max(0,min(q_r,q_lev,q_total,q_sym,q_pos));sg=1 if side=="long" else -1
-        return {"qty":qty,"risk_cash":risk,"tp1":entry+sg*dist*p["tp1_r"],"tp2":entry+sg*dist*p["tp2_r"],"tp3":entry+sg*dist*p["tp3_r"],"params":p}
+        return {"qty":qty,"risk_cash":risk,"sl1":entry-sg*dist*p["sl1_r"],"tp1":entry+sg*dist*p["tp1_r"],"tp2":entry+sg*dist*p["tp2_r"],"tp3":entry+sg*dist*p["tp3_r"],"params":p}
 
 risk_manager=RiskManager()
