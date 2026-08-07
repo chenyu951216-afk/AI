@@ -44,27 +44,61 @@ class BitgetPublic:
     async def depth_imbalance(self,symbol:str,levels:int=20)->float:
         d=await self._get("/api/v2/mix/market/merge-depth",{"symbol":symbol,"productType":settings.bitget_product_type,"precision":"scale0","limit":levels});bids=(d or {}).get("bids",[]);asks=(d or {}).get("asks",[]);b=sum(float(x[1]) for x in bids[:levels]);a=sum(float(x[1]) for x in asks[:levels]);return (b-a)/(b+a) if b+a else 0.
 
+class CoinGlassDeferred(RuntimeError):pass
+
 class CoinGlass:
+    REQUEST_SPACING_SEC=20
+    RATE_LIMIT_COOLDOWN_SEC=900
+    LIQUIDATION_CACHE_SEC=4*3600
+    OI_CACHE_SEC=3600
+    ADVANCED_RETRY_SEC=24*3600
     def __init__(self):
         self.client=httpx.AsyncClient(base_url=settings.coinglass_base_url,timeout=15,headers={"CG-API-KEY":settings.coinglass_api_key} if settings.coinglass_api_key else {})
-        self.cache={};self.last_ok=0.;self.last_error=None;self.last_endpoint=None;self.success_count=0;self.error_count=0;self.liq_last_ok=0.;self.liq_last_error=None;self.liq_source=None;self.advanced_blocked_until=0.;self.advanced_error=None
+        self.cache={};self.last_ok=0.;self.last_error=None;self.last_endpoint=None;self.success_count=0;self.error_count=0
+        self.liq_last_ok=0.;self.liq_last_error=None;self.liq_source=None;self.advanced_blocked_until=0.;self.advanced_error=None
+        self.request_lock=asyncio.Lock();self.next_request_at=0.;self.cooldown_until=0.;self.skipped_count=0;self.stale_count=0
     def ready(self):return bool(settings.coinglass_enabled and settings.coinglass_api_key)
     def health(self):
+        now=time.time()
         if not settings.coinglass_enabled:return {"status":"DISABLED","ok":False,"last_error":None,"last_ok":None}
         if not settings.coinglass_api_key:return {"status":"NO_KEY","ok":False,"last_error":None,"last_ok":None}
-        if self.last_error and (not self.last_ok or time.time()-self.last_ok>settings.coinglass_cache_sec*2):status="API_ERROR"
+        if now<self.cooldown_until:status="RATE_LIMITED"
+        elif self.last_error and (not self.last_ok or now-self.last_ok>max(settings.coinglass_cache_sec*2,600)):status="API_ERROR"
         elif self.last_ok:status="OK"
         else:status="WAITING_FIRST_SUCCESS"
-        liq_status="OK" if self.liq_last_ok and not self.liq_last_error else "ERROR" if self.liq_last_error else "WAITING"
-        return {"status":status,"ok":status=="OK","last_error":self.last_error,"last_ok":int(self.last_ok*1000) if self.last_ok else None,"endpoint":self.last_endpoint,"success_count":self.success_count,"error_count":self.error_count,"liquidation_status":liq_status,"liquidation_error":self.liq_last_error,"liquidation_last_ok":int(self.liq_last_ok*1000) if self.liq_last_ok else None,"liquidation_source":self.liq_source,"advanced_error":self.advanced_error}
-    async def _get_cached(self,key,path,params):
-        c=self.cache.get(key)
-        if c and time.time()-c[0]<settings.coinglass_cache_sec:return c[1]
-        try:
-            r=await self.client.get(path,params=params);r.raise_for_status();j=r.json()
-            if str(j.get("code")) not in {"0","00000"}:raise RuntimeError(f"{j.get('code')} {j.get('msg','CoinGlass error')}")
-            d=j.get("data");self.cache[key]=(time.time(),d);self.last_ok=time.time();self.last_error=None;self.last_endpoint=path;self.success_count+=1;return d
-        except Exception as e:self.last_error=str(e);self.last_endpoint=path;self.error_count+=1;raise
+        if now<self.cooldown_until:liq_status="COOLDOWN"
+        elif self.liq_last_ok and not self.liq_last_error:liq_status="OK"
+        elif self.liq_last_error:liq_status="ERROR"
+        else:liq_status="WAITING"
+        return {"status":status,"ok":status=="OK","last_error":self.last_error,"last_ok":int(self.last_ok*1000) if self.last_ok else None,"endpoint":self.last_endpoint,"success_count":self.success_count,"error_count":self.error_count,"liquidation_status":liq_status,"liquidation_error":self.liq_last_error,"liquidation_last_ok":int(self.liq_last_ok*1000) if self.liq_last_ok else None,"liquidation_source":self.liq_source,"advanced_error":self.advanced_error,"cooldown_until":int(self.cooldown_until*1000) if self.cooldown_until else None,"skipped_count":self.skipped_count,"stale_count":self.stale_count}
+    def _stale_or_defer(self,c,message):
+        if c:
+            self.stale_count+=1;return c[1]
+        self.skipped_count+=1;raise CoinGlassDeferred(message)
+    async def _get_cached(self,key,path,params,ttl=None):
+        ttl=max(1,int(ttl or settings.coinglass_cache_sec));c=self.cache.get(key);now=time.time()
+        if c and now-c[0]<ttl:return c[1]
+        if now<self.cooldown_until:return self._stale_or_defer(c,f"CoinGlass rate-limit cooldown until {int(self.cooldown_until)}")
+        if now<self.next_request_at:return self._stale_or_defer(c,"CoinGlass global request pacing")
+        async with self.request_lock:
+            c=self.cache.get(key);now=time.time()
+            if c and now-c[0]<ttl:return c[1]
+            if now<self.cooldown_until:return self._stale_or_defer(c,"CoinGlass rate-limit cooldown")
+            if now<self.next_request_at:return self._stale_or_defer(c,"CoinGlass global request pacing")
+            self.next_request_at=now+self.REQUEST_SPACING_SEC
+            try:
+                r=await self.client.get(path,params=params)
+                if r.status_code==429:
+                    try:retry=float(r.headers.get("Retry-After") or 0)
+                    except Exception:retry=0
+                    retry=max(self.RATE_LIMIT_COOLDOWN_SEC,retry)
+                    self.cooldown_until=time.time()+retry;self.last_error=f"429 Too Many Requests; cooldown {int(retry)}s";self.last_endpoint=path;self.error_count+=1
+                    return self._stale_or_defer(c,self.last_error)
+                r.raise_for_status();j=r.json()
+                if str(j.get("code")) not in {"0","00000"}:raise RuntimeError(f"{j.get('code')} {j.get('msg','CoinGlass error')}")
+                d=j.get("data");self.cache[key]=(time.time(),d);self.last_ok=time.time();self.last_error=None;self.last_endpoint=path;self.success_count+=1;return d
+            except CoinGlassDeferred:raise
+            except Exception as e:self.last_error=str(e);self.last_endpoint=path;self.error_count+=1;raise
     @staticmethod
     def _clusters_from_heatmap(d,price):
         ys=[float(x) for x in (d or {}).get("y_axis",[])];weights={}
@@ -75,15 +109,17 @@ class CoinGlass:
         above=[(ys[i],v) for i,v in weights.items() if 0<=i<len(ys) and ys[i]>price];below=[(ys[i],v) for i,v in weights.items() if 0<=i<len(ys) and ys[i]<price];a=max(above,key=lambda z:z[1],default=(0.,0.));b=max(below,key=lambda z:z[1],default=(0.,0.));return {"above":a[0],"above_strength":a[1],"below":b[0],"below_strength":b[1],"source":"heatmap_model1"}
     async def liquidation_context(self,symbol,price):
         if not self.ready():return {}
-        if time.time()>=self.advanced_blocked_until:
+        now=time.time()
+        if now>=self.advanced_blocked_until and now>=self.cooldown_until:
             try:
-                d=await self._get_cached("liq1:"+symbol,"/api/futures/liquidation/heatmap/model1",{"exchange":settings.coinglass_exchange,"symbol":symbol,"range":"24h"}) or {};z=self._clusters_from_heatmap(d,price)
+                d=await self._get_cached("liq1:"+symbol,"/api/futures/liquidation/heatmap/model1",{"exchange":settings.coinglass_exchange,"symbol":symbol,"range":"24h"},self.LIQUIDATION_CACHE_SEC) or {};z=self._clusters_from_heatmap(d,price)
                 if z.get("above") or z.get("below"):
                     self.liq_last_ok=time.time();self.liq_last_error=None;self.liq_source="heatmap_model1";self.advanced_error=None;z["mode"]="HEATMAP";return z
                 raise RuntimeError("heatmap returned no usable liquidation levels")
-            except Exception as e:self.advanced_error=str(e);self.advanced_blocked_until=time.time()+3600
+            except CoinGlassDeferred:return {}
+            except Exception as e:self.advanced_error=str(e);self.advanced_blocked_until=time.time()+self.ADVANCED_RETRY_SEC
         try:
-            rows=await self._get_cached("liqhist4h:"+symbol,"/api/futures/liquidation/history",{"exchange":settings.coinglass_exchange,"symbol":symbol,"interval":"4h","limit":8}) or [];clean=[]
+            rows=await self._get_cached("liqhist4h:"+symbol,"/api/futures/liquidation/history",{"exchange":settings.coinglass_exchange,"symbol":symbol,"interval":"4h","limit":8},self.LIQUIDATION_CACHE_SEC) or [];clean=[]
             for x in rows:
                 try:clean.append((int(x.get("time") or 0),float(x.get("long_liquidation_usd") or 0),float(x.get("short_liquidation_usd") or 0)))
                 except Exception:pass
@@ -91,12 +127,15 @@ class CoinGlass:
             if not clean:raise RuntimeError("4h liquidation history returned no rows")
             _,long_usd,short_usd=clean[-1];prev=[a+b for _,a,b in clean[:-1] if a+b>0];base=float(pd.Series(prev).median()) if prev else max(long_usd+short_usd,1.);spike=(long_usd+short_usd)/max(base,1.)
             self.liq_last_ok=time.time();self.liq_last_error=None;self.liq_source="pair_liquidation_history_4h";return {"mode":"FLOW_4H","long_usd":long_usd,"short_usd":short_usd,"spike_ratio":spike,"source":self.liq_source}
+        except CoinGlassDeferred:
+            if time.time()<self.cooldown_until:self.liq_last_error=f"rate limited; automatic cooldown until {int(self.cooldown_until)}"
+            return {}
         except Exception as e:self.liq_last_error=f"advanced={self.advanced_error or 'not tried'}; fallback4h={e}";return {}
     async def oi_change_30m(self,symbol):
         if not self.ready():return None
         coin=symbol.removesuffix("USDT")
         try:
-            d=await self._get_cached("oi:"+coin,"/api/futures/open-interest/exchange-list",{"symbol":coin}) or [];row=next((x for x in d if str(x.get("exchange")).lower()=="all"),None) or (d[0] if d else None);return float(row.get("open_interest_change_percent_30m")) if row else None
+            d=await self._get_cached("oi:"+coin,"/api/futures/open-interest/exchange-list",{"symbol":coin},self.OI_CACHE_SEC) or [];row=next((x for x in d if str(x.get("exchange")).lower()=="all"),None) or (d[0] if d else None);return float(row.get("open_interest_change_percent_30m")) if row else None
         except Exception:return None
 
 class MarketData:
