@@ -8,7 +8,7 @@ from .market import market
 from .paper import paper_broker
 from .strategies import SPECS,SPEC_MAP,build_strategy,min_score
 
-MODEL_VERSION="2026-08-07-closed-k-timeframes-posttrade-liveallocator-v3"
+MODEL_VERSION="2026-08-08-11strategies-independent-entry-exit-rank-cghealth-v4"
 
 class Engine:
     def __init__(self):
@@ -27,10 +27,13 @@ class Engine:
                 for sym in market.batch_for_cycle(self.universe):
                     await self.scan_symbol(sym);await asyncio.sleep(.04)
                 learner.run();self.last_scan=int(time.time()*1000);self.last_error=None;self.scan_count+=1
-            except Exception as e:self.last_error=f"{type(e).__name__}: {e}";db.event("ENGINE_ERROR",self.last_error,"ERROR");traceback.print_exc()
+            except Exception as e:
+                self.last_error=f"{type(e).__name__}: {e}";db.event("ENGINE_ERROR",self.last_error,"ERROR");traceback.print_exc()
             await asyncio.sleep(settings.scan_interval_sec)
     async def scan_symbol(self,symbol):
-        states=db.query("SELECT * FROM strategy_state WHERE enabled=1");need_depth=any(s["strategy"]=="orderbook" for s in states);cg_allowed=symbol in set(self.universe[:max(0,settings.coinglass_top_symbols)]);need_liq=cg_allowed and any(s["strategy"]=="liquidation_magnet" for s in states);need_cg=cg_allowed and any(s["strategy"]=="oi_trend" for s in states);snap=await market.snapshot(symbol,need_depth,need_liq,need_cg)
+        states=db.query("SELECT * FROM strategy_state WHERE enabled=1");cg_allowed=symbol in set(self.universe[:max(0,settings.coinglass_top_symbols)])
+        need_depth=any(s["strategy"]=="orderbook" for s in states);need_liq=cg_allowed and any(s["strategy"]=="liquidation_magnet" for s in states);need_cg=cg_allowed and any(s["strategy"]=="oi_trend" for s in states)
+        snap=await market.snapshot(symbol,need_depth,need_liq,need_cg)
         if not snap:return
         paper_broker.observe_snapshot(snap)
         if live_adapter.credentials_ready():
@@ -42,7 +45,6 @@ class Engine:
             if c:await self._evaluate_variant(state,snap,"challenger",json.loads(c["params_json"]),prices)
     async def _evaluate_variant(self,state,snap,variant,params,prices):
         name=state["strategy"];spec=SPEC_MAP[name];tf=spec.signal_tf;bar_ts=snap.closed_ts(tf)
-        # Exactly one decision per strategy/variant/symbol/fully-closed signal bar, persisted across restarts.
         if db.one("SELECT 1 FROM strategy_eval_bars WHERE strategy=? AND variant=? AND symbol=? AND tf=? AND bar_ts=?",(name,variant,snap.symbol,tf,bar_ts)):return
         db.execute("INSERT OR IGNORE INTO strategy_eval_bars(strategy,variant,symbol,tf,bar_ts)VALUES(?,?,?,?,?)",(name,variant,snap.symbol,tf,bar_ts))
         if db.one("SELECT id FROM positions WHERE strategy=? AND variant=? AND symbol=?",(name,variant,snap.symbol)):return
