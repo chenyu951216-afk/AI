@@ -20,6 +20,7 @@ SPECIFIC_BOUNDS={
 }
 STOP_PARAM={k:"atr_stop" for k in SPECIFIC_BOUNDS};STOP_PARAM["smc_liquidity"]="atr_buffer";STOP_PARAM["fib_pullback"]="stop_buffer_atr"
 SIZING=["risk_pct","leverage","max_positions","max_position_notional_pct","max_symbol_exposure_pct","max_total_exposure_pct"]
+EXITS=["sl1_r","sl1_fraction","tp1_r","tp2_r","tp3_r","tp1_fraction","tp2_fraction","breakeven_trigger_r","breakeven_offset_r","trail_start_r","trail_r"]
 INT_KEYS={"max_positions","lookback","min_adx","rsi_long","rsi_low","rsi_extreme","max_adx","max_context_adx","max_rsi","sweep_lookback","breakout_lookback","compression_lookback","retest_lookback","rank_max","base_lookback","rebound_rsi","rejection_rsi","swing_lookback","exhaustion_rsi","continuation_rsi"}
 
 def completed_roundtrips(strategy,variant="champion",limit=1000,since=None):
@@ -66,9 +67,10 @@ def exit_quality(d):
     bad=sum(d["ratios"].get(k,0) for k in ["PARTIAL_SL_TOO_EARLY_CANDIDATE","STOP_TOO_TIGHT_CANDIDATE","TRAIL_OR_BE_TOO_TIGHT_CANDIDATE","TP_TOO_EARLY_CANDIDATE","TP_TOO_FAR_OR_GIVEBACK","LOW_EXIT_CAPTURE"]);return d["avg_capture"]-.20*bad
 
 def learning_progress(trades,m,diag):
+    """Live-readiness maturity recalculated from current evidence; it intentionally can move backwards."""
     n=m["n"];days=sample_days(trades);rw=robust_windows(trades);syms=symbol_count(trades);conc=profit_concentration(trades) if trades else 1.
     def cap(x):return max(0.,min(1.,x))
-    sample=cap(n/max(settings.final_min_trades,1));age=cap(days/max(settings.final_min_days,1));pf=cap(m["pf"]/max(settings.final_min_pf,1e-9));spf=cap(m["stress_pf"]/max(settings.final_min_stress_pf,1e-9));exp=cap(.5+m["avg_r"]/.5) if n else 0;dd=cap(1-m["max_dd_pct"]/max(settings.final_max_dd_pct*1.8,.01));rob=cap(rw/max(settings.final_min_robust_windows,1e-9));div=cap(syms/max(settings.final_min_symbols,1));con=cap((1-conc)/max(1-settings.final_max_symbol_profit_share,1e-9));post=cap(diag["n"]/max(settings.post_trade_min_studies*2,1))
+    sample=cap(n/max(settings.final_min_trades,1));age=cap(days/max(settings.final_min_days,1));pf=cap(m["pf"]/max(settings.final_min_pf,1e-9));spf=cap(m["stress_pf"]/max(settings.final_min_stress_pf,1e-9));exp=cap(.5+m["avg_r"]/.5) if n else 0;dd=cap(1-m["max_dd_pct"]/max(settings.final_max_dd_pct*1.8,.01)) if n>=10 else 0.;rob=cap(rw/max(settings.final_min_robust_windows,1e-9));div=cap(syms/max(settings.final_min_symbols,1));con=cap((1-conc)/max(1-settings.final_max_symbol_profit_share,1e-9)) if n>=20 else 0.;post=cap(diag["n"]/max(settings.post_trade_min_studies*2,1))
     parts={"樣本":sample,"天數":age,"PF":pf,"StressPF":spf,"期望值":exp,"回撤":dd,"穩定窗":rob,"幣種分散":div,"收益分散":con,"出場檢討":post};weights={"樣本":.16,"天數":.10,"PF":.14,"StressPF":.10,"期望值":.10,"回撤":.11,"穩定窗":.11,"幣種分散":.05,"收益分散":.05,"出場檢討":.08};pct=round(100*sum(parts[k]*weights[k] for k in weights),1)
     if n<10:pct=min(pct,22.)
     if n>=20 and m["expectancy"]<=0:pct=min(pct,58.)
