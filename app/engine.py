@@ -8,7 +8,7 @@ from .market import market
 from .paper import paper_broker
 from .strategies import SPECS,SPEC_MAP,build_strategy,min_score
 
-MODEL_VERSION="2026-08-08-11strategies-independent-entry-exit-rank-cghealth-v4"
+MODEL_VERSION="2026-08-08-11strategies-independent-entry-exit-rank-cgflow-v5"
 
 class Engine:
     def __init__(self):
