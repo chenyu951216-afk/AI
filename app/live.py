@@ -34,6 +34,8 @@ class BitgetLiveAdapter:
     async def positions(self):return await self._private("GET","/api/v2/mix/position/all-position",{"productType":settings.bitget_product_type,"marginCoin":settings.bitget_margin_coin})
     async def pending_plans(self,symbol):
         d=await self._private("GET","/api/v2/mix/order/orders-plan-pending",{"symbol":symbol,"planType":"profit_loss","productType":settings.bitget_product_type,"limit":"100"});return (d or {}).get("entrustedList",[]) if isinstance(d,dict) else []
+    async def plan_history(self,symbol):
+        d=await self._private("GET","/api/v2/mix/order/orders-plan-history",{"symbol":symbol,"planType":"profit_loss","productType":settings.bitget_product_type,"limit":"100"});return (d or {}).get("entrustedList",[]) if isinstance(d,dict) else []
     async def set_leverage(self,symbol,leverage,side):
         p={"symbol":symbol,"productType":settings.bitget_product_type,"marginCoin":settings.bitget_margin_coin,"leverage":str(leverage)}
         if settings.bitget_position_mode=="hedge_mode" and settings.bitget_margin_mode=="isolated":p["holdSide"]="long" if side=="long" else "short"
@@ -112,18 +114,24 @@ class BitgetLiveAdapter:
         required=[("STOP",stop,Decimal("0"),"pos_loss"),("TP3",tp3,Decimal("0"),"pos_profit")]
         if settings.live_partial_tp_enabled:required=[("STOP",stop,Decimal("0"),"pos_loss"),("SL1",sl1,qsl,"loss_plan"),("TP1",tp1,q1,"profit_plan"),("TP2",tp2,q2,"profit_plan"),("TP3",tp3,Decimal("0"),"pos_profit")]
         for attempt in range(max(1,settings.live_protection_retry)):
-            pending=await self.pending_plans(order["symbol"]);dbp={x["role"]:x for x in db.query("SELECT * FROM live_protections WHERE live_order_id=?",(order["id"],))};missing=[]
+            pending=await self.pending_plans(order["symbol"]);history=await self.plan_history(order["symbol"]);dbp={x["role"]:x for x in db.query("SELECT * FROM live_protections WHERE live_order_id=?",(order["id"],))};missing=[]
             for role,trig,size,ptype in required:
                 pr=dbp.get(role);found=None
+                if pr and pr.get("status")=="FILLED":continue
                 if pr:
                     for x in pending:
                         if (pr.get("order_id") and str(x.get("orderId"))==str(pr["order_id"])) or (pr.get("client_oid") and str(x.get("clientOid"))==str(pr["client_oid"])):found=x;break
+                    if not found:
+                        for hx in history:
+                            same=(pr.get("order_id") and str(hx.get("orderId"))==str(pr["order_id"])) or (pr.get("client_oid") and str(hx.get("clientOid"))==str(pr["client_oid"]))
+                            if same and str(hx.get("planStatus") or hx.get("status") or "").lower()=="executed":
+                                now=int(time.time()*1000);db.execute("UPDATE live_protections SET status='FILLED',detail_json=?,last_verified_at=?,updated_at=? WHERE id=?",(json.dumps(hx),now,now,pr["id"]));continue
                 if not found:
                     for x in pending:
                         cid=str(x.get("clientOid") or "")
                         if cid.startswith(str(order["client_oid"])) and role.lower() in cid.lower() and self._near(self._plan_trigger(x,role),trig):found=x;break
                 if found:self._upsert_protection(order["id"],role,str(found.get("orderId") or ""),str(found.get("clientOid") or ""),trig,float(size),"LIVE",found)
-                else:missing.append((role,trig,size,ptype))
+                elif not (db.one("SELECT 1 FROM live_protections WHERE live_order_id=? AND role=? AND status='FILLED'",(order["id"],role))):missing.append((role,trig,size,ptype))
             if not missing:return True
             for role,trig,size,ptype in missing:
                 try:
@@ -133,8 +141,8 @@ class BitgetLiveAdapter:
                         cid,res=await self._place_partial_plan(order,role,trig,size,ptype);oid=(res or {}).get("orderId") if isinstance(res,dict) else "";self._upsert_protection(order["id"],role,str(oid or ""),cid,trig,float(size),"LIVE",res)
                 except Exception as e:db.risk_event("LIVE_PROTECTION_PLACE_FAILED",f"{role}: {e}",order["strategy"],"champion",order["symbol"])
             await asyncio.sleep(.45*(attempt+1))
-        verified={x["role"] for x in db.query("SELECT role FROM live_protections WHERE live_order_id=? AND status='LIVE'",(order["id"],))};critical_ok="STOP" in verified and "TP3" in verified
-        if critical_ok:db.risk_event("LIVE_PROTECTION_PARTIAL","Critical full STOP + final TP verified; partial SL/TP will keep repairing",order["strategy"],"champion",order["symbol"]);return True
+        verified={x["role"] for x in db.query("SELECT role FROM live_protections WHERE live_order_id=? AND status IN('LIVE','FILLED')",(order["id"],))};critical_ok="STOP" in verified and "TP3" in verified
+        if critical_ok:db.risk_event("LIVE_PROTECTION_PARTIAL","Critical full STOP + final TP verified; partial SL/TP will keep repairing unless already executed",order["strategy"],"champion",order["symbol"]);return True
         db.risk_event("LIVE_PROTECTION_INCOMPLETE","Could not verify critical full STOP and final TP",order["strategy"],"champion",order["symbol"])
         if settings.live_emergency_close_on_protection_failure:await self.emergency_close(order,"critical protection verification failed")
         return False
@@ -167,7 +175,7 @@ class BitgetLiveAdapter:
             rows=await self.positions() or [];self.last_positions=rows;self.last_sync=time.time();self.last_sync_error=None;active={str(p.get("symbol") or "").upper() for p in rows if self._position_size(p)>0}
             for order in db.query("SELECT * FROM live_orders WHERE status='OPEN'"):
                 if order["symbol"].upper() not in active:
-                    db.execute("UPDATE live_orders SET status='CLOSED',updated_at=? WHERE id=?",(int(time.time()*1000),order["id"]));db.execute("UPDATE live_protections SET status='CLOSED',updated_at=? WHERE live_order_id=?",(int(time.time()*1000),order["id"]));continue
+                    db.execute("UPDATE live_orders SET status='CLOSED',updated_at=? WHERE id=?",(int(time.time()*1000),order["id"]));db.execute("UPDATE live_protections SET status='CLOSED',updated_at=? WHERE live_order_id=? AND status NOT IN('FILLED')",(int(time.time()*1000),order["id"]));continue
                 if time.time()-self.last_protection_verify>=settings.live_protection_verify_sec:
                     pos=db.one("SELECT * FROM positions WHERE id=?",(order["paper_position_id"],));await self.ensure_protections(order,pos)
             self.last_protection_verify=time.time();return rows
