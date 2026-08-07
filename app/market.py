@@ -16,6 +16,7 @@ class MarketSnapshot:
     funding:float;oi:float;oi_change_30m:float;regime:str;macro_regime:str
     orderbook_imbalance:float|None=None;liquidation_above:float|None=None;liquidation_below:float|None=None
     liquidation_above_strength:float=0.;liquidation_below_strength:float=0.;cg_oi_change_30m:float|None=None
+    liquidation_long_usd:float=0.;liquidation_short_usd:float=0.;liquidation_spike_ratio:float=0.;liquidation_mode:str="NONE"
     change24h:float=0.;gainer_rank:int=0;loser_rank:int=0;high24h:float=0.;low24h:float=0.
     def df(self,tf:str)->pd.DataFrame:return self.frames[tf]
     def last(self,tf:str):return self.frames[tf].iloc[-1]
@@ -45,16 +46,17 @@ class BitgetPublic:
 
 class CoinGlass:
     def __init__(self):
-        self.client=httpx.AsyncClient(base_url=settings.coinglass_base_url,timeout=15,headers={"CG-API-KEY":settings.coinglass_api_key} if settings.coinglass_api_key else {});self.cache={};self.last_ok=0.;self.last_error=None;self.last_endpoint=None;self.success_count=0;self.error_count=0;self.liq_last_ok=0.;self.liq_last_error=None;self.liq_source=None
+        self.client=httpx.AsyncClient(base_url=settings.coinglass_base_url,timeout=15,headers={"CG-API-KEY":settings.coinglass_api_key} if settings.coinglass_api_key else {})
+        self.cache={};self.last_ok=0.;self.last_error=None;self.last_endpoint=None;self.success_count=0;self.error_count=0;self.liq_last_ok=0.;self.liq_last_error=None;self.liq_source=None;self.advanced_blocked_until=0.;self.advanced_error=None
     def ready(self):return bool(settings.coinglass_enabled and settings.coinglass_api_key)
     def health(self):
-        if not settings.coinglass_enabled:return {"status":"DISABLED","ok":False,"last_error":None,"last_ok":None,"liquidation_status":"DISABLED"}
-        if not settings.coinglass_api_key:return {"status":"NO_KEY","ok":False,"last_error":None,"last_ok":None,"liquidation_status":"NO_KEY"}
+        if not settings.coinglass_enabled:return {"status":"DISABLED","ok":False,"last_error":None,"last_ok":None}
+        if not settings.coinglass_api_key:return {"status":"NO_KEY","ok":False,"last_error":None,"last_ok":None}
         if self.last_error and (not self.last_ok or time.time()-self.last_ok>settings.coinglass_cache_sec*2):status="API_ERROR"
         elif self.last_ok:status="OK"
         else:status="WAITING_FIRST_SUCCESS"
         liq_status="OK" if self.liq_last_ok and not self.liq_last_error else "ERROR" if self.liq_last_error else "WAITING"
-        return {"status":status,"ok":status=="OK","last_error":self.last_error,"last_ok":int(self.last_ok*1000) if self.last_ok else None,"endpoint":self.last_endpoint,"success_count":self.success_count,"error_count":self.error_count,"liquidation_status":liq_status,"liquidation_error":self.liq_last_error,"liquidation_last_ok":int(self.liq_last_ok*1000) if self.liq_last_ok else None,"liquidation_source":self.liq_source}
+        return {"status":status,"ok":status=="OK","last_error":self.last_error,"last_ok":int(self.last_ok*1000) if self.last_ok else None,"endpoint":self.last_endpoint,"success_count":self.success_count,"error_count":self.error_count,"liquidation_status":liq_status,"liquidation_error":self.liq_last_error,"liquidation_last_ok":int(self.liq_last_ok*1000) if self.liq_last_ok else None,"liquidation_source":self.liq_source,"advanced_error":self.advanced_error}
     async def _get_cached(self,key,path,params):
         c=self.cache.get(key)
         if c and time.time()-c[0]<settings.coinglass_cache_sec:return c[1]
@@ -71,30 +73,25 @@ class CoinGlass:
                 try:weights[int(row[1])]=weights.get(int(row[1]),0)+float(row[2])
                 except Exception:pass
         above=[(ys[i],v) for i,v in weights.items() if 0<=i<len(ys) and ys[i]>price];below=[(ys[i],v) for i,v in weights.items() if 0<=i<len(ys) and ys[i]<price];a=max(above,key=lambda z:z[1],default=(0.,0.));b=max(below,key=lambda z:z[1],default=(0.,0.));return {"above":a[0],"above_strength":a[1],"below":b[0],"below_strength":b[1],"source":"heatmap_model1"}
-    @staticmethod
-    def _clusters_from_map(d,price):
-        raw=(d or {}).get("data",d or {});levels=[]
-        if isinstance(raw,dict):
-            for k,v in raw.items():
-                try:
-                    px=float(k);strength=0.
-                    for row in v if isinstance(v,list) else []:
-                        if isinstance(row,list) and len(row)>=2:strength+=abs(float(row[1]))
-                    if strength>0:levels.append((px,strength))
-                except Exception:pass
-        above=[x for x in levels if x[0]>price];below=[x for x in levels if x[0]<price];a=max(above,key=lambda z:z[1],default=(0.,0.));b=max(below,key=lambda z:z[1],default=(0.,0.));return {"above":a[0],"above_strength":a[1],"below":b[0],"below_strength":b[1],"source":"liquidation_map"}
-    async def liquidation_clusters(self,symbol,price):
+    async def liquidation_context(self,symbol,price):
         if not self.ready():return {}
-        try:
-            d=await self._get_cached("liq1:"+symbol,"/api/futures/liquidation/heatmap/model1",{"exchange":settings.coinglass_exchange,"symbol":symbol,"range":"24h"}) or {};z=self._clusters_from_heatmap(d,price)
-            if z.get("above") or z.get("below"):self.liq_last_ok=time.time();self.liq_last_error=None;self.liq_source=z.get("source");return z
-            raise RuntimeError("CoinGlass heatmap returned no usable liquidation levels")
-        except Exception as first:
+        if time.time()>=self.advanced_blocked_until:
             try:
-                d=await self._get_cached("liqmap:"+symbol,"/api/futures/liquidation/map",{"exchange":settings.coinglass_exchange,"symbol":symbol,"range":"1d"}) or {};z=self._clusters_from_map(d,price)
-                if z.get("above") or z.get("below"):self.liq_last_ok=time.time();self.liq_last_error=None;self.liq_source=z.get("source");return z
-                self.liq_last_error=f"heatmap: {first}; map: no usable levels";return {}
-            except Exception as second:self.liq_last_error=f"heatmap: {first}; map: {second}";return {}
+                d=await self._get_cached("liq1:"+symbol,"/api/futures/liquidation/heatmap/model1",{"exchange":settings.coinglass_exchange,"symbol":symbol,"range":"24h"}) or {};z=self._clusters_from_heatmap(d,price)
+                if z.get("above") or z.get("below"):
+                    self.liq_last_ok=time.time();self.liq_last_error=None;self.liq_source="heatmap_model1";self.advanced_error=None;z["mode"]="HEATMAP";return z
+                raise RuntimeError("heatmap returned no usable liquidation levels")
+            except Exception as e:self.advanced_error=str(e);self.advanced_blocked_until=time.time()+3600
+        try:
+            rows=await self._get_cached("liqhist4h:"+symbol,"/api/futures/liquidation/history",{"exchange":settings.coinglass_exchange,"symbol":symbol,"interval":"4h","limit":8}) or [];clean=[]
+            for x in rows:
+                try:clean.append((int(x.get("time") or 0),float(x.get("long_liquidation_usd") or 0),float(x.get("short_liquidation_usd") or 0)))
+                except Exception:pass
+            clean.sort(key=lambda z:z[0])
+            if not clean:raise RuntimeError("4h liquidation history returned no rows")
+            _,long_usd,short_usd=clean[-1];prev=[a+b for _,a,b in clean[:-1] if a+b>0];base=float(pd.Series(prev).median()) if prev else max(long_usd+short_usd,1.);spike=(long_usd+short_usd)/max(base,1.)
+            self.liq_last_ok=time.time();self.liq_last_error=None;self.liq_source="pair_liquidation_history_4h";return {"mode":"FLOW_4H","long_usd":long_usd,"short_usd":short_usd,"spike_ratio":spike,"source":self.liq_source}
+        except Exception as e:self.liq_last_error=f"advanced={self.advanced_error or 'not tried'}; fallback4h={e}";return {}
     async def oi_change_30m(self,symbol):
         if not self.ready():return None
         coin=symbol.removesuffix("USDT")
@@ -149,7 +146,7 @@ class MarketData:
             frame_tasks=[self.bitget.candles(symbol,tf,280) for tf in REQUIRED_TFS];res=await asyncio.gather(*frame_tasks,self.bitget.oi(symbol),self.bitget.funding(symbol),self.macro_regime());frames={tf:res[i] for i,tf in enumerate(REQUIRED_TFS)};oi=res[-3];fund=res[-2];macro=res[-1]
             if any(len(frames[tf])<80 for tf in REQUIRED_TFS):return None
         except Exception:return None
-        now=int(time.time()*1000);bucket=now-now%(5*60_000);db.execute("INSERT OR REPLACE INTO oi_snapshots(symbol,ts,oi)VALUES(?,?,?)",(symbol,bucket,oi));old=db.one("SELECT oi FROM oi_snapshots WHERE symbol=? AND ts<=? ORDER BY ts DESC LIMIT 1",(symbol,now-25*60_000));chg=(oi-float(old["oi"]))/float(old["oi"]) if old and float(old["oi"]) else 0.;depth=await self.bitget.depth_imbalance(symbol) if need_depth else None;liq=await self.cg.liquidation_clusters(symbol,price) if need_liq else {};cg_oi=await self.cg.oi_change_30m(symbol) if need_cg_oi else None;reg=self.local_regime(frames);rank=self.rank_map.get(symbol,{})
-        return MarketSnapshot(symbol,price,bid,ask,vol,frames,fund,oi,chg,reg,macro,depth,liq.get("above"),liq.get("below"),liq.get("above_strength",0),liq.get("below_strength",0),cg_oi,float(rank.get("change24h",0)),int(rank.get("gainer_rank",0)),int(rank.get("loser_rank",0)),high24,low24)
+        now=int(time.time()*1000);bucket=now-now%(5*60_000);db.execute("INSERT OR REPLACE INTO oi_snapshots(symbol,ts,oi)VALUES(?,?,?)",(symbol,bucket,oi));old=db.one("SELECT oi FROM oi_snapshots WHERE symbol=? AND ts<=? ORDER BY ts DESC LIMIT 1",(symbol,now-25*60_000));chg=(oi-float(old["oi"]))/float(old["oi"]) if old and float(old["oi"]) else 0.;depth=await self.bitget.depth_imbalance(symbol) if need_depth else None;liq=await self.cg.liquidation_context(symbol,price) if need_liq else {};cg_oi=await self.cg.oi_change_30m(symbol) if need_cg_oi else None;reg=self.local_regime(frames);rank=self.rank_map.get(symbol,{})
+        return MarketSnapshot(symbol,price,bid,ask,vol,frames,fund,oi,chg,reg,macro,depth,liq.get("above"),liq.get("below"),liq.get("above_strength",0),liq.get("below_strength",0),cg_oi,float(liq.get("long_usd",0)),float(liq.get("short_usd",0)),float(liq.get("spike_ratio",0)),str(liq.get("mode","NONE")),float(rank.get("change24h",0)),int(rank.get("gainer_rank",0)),int(rank.get("loser_rank",0)),high24,low24)
 
 market=MarketData()
