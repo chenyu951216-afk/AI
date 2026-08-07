@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import replace
-from .models import Signal,StrategySpec
-from .indicators import fib_context,safe
+from .models import Signal, StrategySpec
+from .indicators import fib_context, safe
 
 COMMON={"risk_pct":.015,"leverage":2.5,"max_positions":4,"max_position_notional_pct":.24,"max_symbol_exposure_pct":.24,"max_total_exposure_pct":1.10,"sl1_r":.62,"sl1_fraction":.18,"tp1_r":.80,"tp2_r":1.60,"tp3_r":2.80,"tp1_fraction":.25,"tp2_fraction":.30,"breakeven_trigger_r":.85,"breakeven_offset_r":.04,"trail_start_r":1.35,"trail_r":1.00}
 def P(**x):p=dict(COMMON);p.update(x);return p
@@ -79,10 +79,15 @@ class OrderbookImbalance(BaseStrategy):
 class LiquidationMagnet(BaseStrategy):
     needs_liquidation=True
     def evaluate(self,m):
-        if not (m.liquidation_above or m.liquidation_below):return None
-        d=m.df("15m");h=m.df("1H");x=d.iloc[-1];p=self.spec.params;atr=safe(x.atr14);a=m.liquidation_above_strength;b=m.liquidation_below_strength;da=(m.liquidation_above-m.price)/max(atr,1e-12) if m.liquidation_above else 999;dd=(m.price-m.liquidation_below)/max(atr,1e-12) if m.liquidation_below else 999
-        if m.liquidation_above and p["min_cluster_atr"]<=da<=p["max_cluster_atr"] and a>b*p["strength_ratio"] and x.close>x.ema20 and x.rsi14<p["max_rsi"]:return sig(self.spec,m,"long",.72+(.02 if h.iloc[-1].ema20>=h.iloc[-1].ema50 else 0),min(float(d.low.iloc[-8:].min()),m.price-p["atr_stop"]*atr),"CoinGlass liquidation cluster above + closed 15m structure",extra={"liq_target":m.liquidation_above,"liq_ratio":a/max(b,1),"liq_distance_atr":da})
-        if m.liquidation_below and p["min_cluster_atr"]<=dd<=p["max_cluster_atr"] and b>a*p["strength_ratio"] and x.close<x.ema20 and x.rsi14>100-p["max_rsi"]:return sig(self.spec,m,"short",.72+(.02 if h.iloc[-1].ema20<=h.iloc[-1].ema50 else 0),max(float(d.high.iloc[-8:].max()),m.price+p["atr_stop"]*atr),"CoinGlass liquidation cluster below + closed 15m structure",extra={"liq_target":m.liquidation_below,"liq_ratio":b/max(a,1),"liq_distance_atr":dd})
+        d=m.df("15m");h=m.df("1H");x=d.iloc[-1];p=self.spec.params;atr=safe(x.atr14)
+        if m.liquidation_mode=="HEATMAP" and (m.liquidation_above or m.liquidation_below):
+            a=m.liquidation_above_strength;b=m.liquidation_below_strength;da=(m.liquidation_above-m.price)/max(atr,1e-12) if m.liquidation_above else 999;dd=(m.price-m.liquidation_below)/max(atr,1e-12) if m.liquidation_below else 999
+            if m.liquidation_above and p["min_cluster_atr"]<=da<=p["max_cluster_atr"] and a>b*p["strength_ratio"] and x.close>x.ema20 and x.rsi14<p["max_rsi"]:return sig(self.spec,m,"long",.72+(.02 if h.iloc[-1].ema20>=h.iloc[-1].ema50 else 0),min(float(d.low.iloc[-8:].min()),m.price-p["atr_stop"]*atr),"CoinGlass heatmap cluster above + closed 15m structure",extra={"liq_source":"heatmap","liq_target":m.liquidation_above,"liq_ratio":a/max(b,1),"liq_distance_atr":da})
+            if m.liquidation_below and p["min_cluster_atr"]<=dd<=p["max_cluster_atr"] and b>a*p["strength_ratio"] and x.close<x.ema20 and x.rsi14>100-p["max_rsi"]:return sig(self.spec,m,"short",.72+(.02 if h.iloc[-1].ema20<=h.iloc[-1].ema50 else 0),max(float(d.high.iloc[-8:].max()),m.price+p["atr_stop"]*atr),"CoinGlass heatmap cluster below + closed 15m structure",extra={"liq_source":"heatmap","liq_target":m.liquidation_below,"liq_ratio":b/max(a,1),"liq_distance_atr":dd})
+        if m.liquidation_mode=="FLOW_4H":
+            l=max(m.liquidation_long_usd,0);sh=max(m.liquidation_short_usd,0);sp=m.liquidation_spike_ratio
+            if l>sh*p["strength_ratio"] and sp>=p["min_liq_spike"] and x.close>x.open and x.close>x.ema20 and x.rsi14<p["max_rsi"]:return sig(self.spec,m,"long",.70+min(.05,(sp-1)*.02),min(float(d.low.iloc[-8:].min()),m.price-p["atr_stop"]*atr),"CoinGlass 4H long-liquidation flush + closed 15m reclaim",extra={"liq_source":"history4h","long_liq":l,"short_liq":sh,"liq_spike":sp})
+            if sh>l*p["strength_ratio"] and sp>=p["min_liq_spike"] and x.close<x.open and x.close<x.ema20 and x.rsi14>100-p["max_rsi"]:return sig(self.spec,m,"short",.70+min(.05,(sp-1)*.02),max(float(d.high.iloc[-8:].max()),m.price+p["atr_stop"]*atr),"CoinGlass 4H short-liquidation squeeze + closed 15m rejection",extra={"liq_source":"history4h","long_liq":l,"short_liq":sh,"liq_spike":sp})
 
 class LoserReboundCycle(BaseStrategy):
     def evaluate(self,m):
@@ -111,7 +116,7 @@ SPECS=[
  StrategySpec("vwap_ema","VWAP / EMA 動能","5m VWAP retest + 15m/1H trend alignment",P(rsi_long=49,retest_lookback=4,atr_stop=1.30,risk_pct=.015,sl1_r=.58,sl1_fraction=.20,tp1_r=.70,tp2_r=1.4,tp3_r=2.6,tp1_fraction=.28,tp2_fraction=.32,breakeven_trigger_r=.75,trail_start_r=1.15,trail_r=.85),"5m",("5m","15m","1H"),.58,.66,.71),
  StrategySpec("mean_reversion","區間均值回歸","5m z-score/RSI + 15m range context",P(max_adx=22,max_context_adx=22,z=1.65,rsi_low=35,atr_stop=1.45,risk_pct=.012,leverage=2,sl1_r=.50,sl1_fraction=.25,tp1_r=.55,tp2_r=1.0,tp3_r=1.8,tp1_fraction=.34,tp2_fraction=.30,breakeven_trigger_r=.60,trail_start_r=.90,trail_r=.65),"5m",("5m","15m"),.57,.65,.70),
  StrategySpec("orderbook","訂單簿失衡","L2 imbalance + fully closed 5m confirmation",P(imbalance=.14,max_spread=.0015,min_rvol=.82,atr_stop=.95,risk_pct=.011,leverage=2,sl1_r=.45,sl1_fraction=.25,tp1_r=.50,tp2_r=.95,tp3_r=1.6,tp1_fraction=.35,tp2_fraction=.30,breakeven_trigger_r=.55,trail_start_r=.80,trail_r=.55),"5m",("5m",),.56,.64,.70),
- StrategySpec("liquidation_magnet","CoinGlass 清算磁鐵","Liquidation heatmap/map + closed 15m structure",P(strength_ratio=1.16,max_rsi=74,min_cluster_atr=.25,max_cluster_atr=7.0,atr_stop=1.35,risk_pct=.013,sl1_r=.65,sl1_fraction=.18,tp1_r=.9,tp2_r=1.65,tp3_r=3.0,breakeven_trigger_r=.9,trail_start_r=1.35,trail_r=1.0),"15m",("15m","1H"),.57,.65,.71),
+ StrategySpec("liquidation_magnet","CoinGlass 爆倉流 / 清算磁鐵","Pro 用 heatmap；低階方案自動改用 4H 爆倉歷史 + closed 15m structure",P(strength_ratio=1.16,max_rsi=74,min_cluster_atr=.25,max_cluster_atr=7.0,min_liq_spike=1.05,atr_stop=1.35,risk_pct=.013,sl1_r=.65,sl1_fraction=.18,tp1_r=.9,tp2_r=1.65,tp3_r=3.0,breakeven_trigger_r=.9,trail_start_r=1.35,trail_r=1.0),"15m",("15m","1H"),.56,.64,.70),
  StrategySpec("loser_rebound_cycle","跌幅榜反彈循環","Top losers: rebound long → rejection short continuation",P(rank_max=18,min_drop_pct=.10,base_lookback=12,min_rvol=.95,rebound_rsi=38,rejection_rsi=44,continuation_rvol=.90,atr_stop=1.35,risk_pct=.016,sl1_r=.55,sl1_fraction=.22,tp1_r=.65,tp2_r=1.25,tp3_r=2.2,tp1_fraction=.32,tp2_fraction=.30,breakeven_trigger_r=.70,trail_start_r=1.0,trail_r=.75),"15m",("15m","1H"),.57,.65,.71),
  StrategySpec("gainer_pullback_cycle","漲幅榜回踩循環","Top gainers: exhaustion short → pullback continuation long",P(rank_max=18,min_gain_pct=.10,swing_lookback=12,exhaustion_rsi=72,exhaustion_rvol=1.25,continuation_rsi=54,continuation_rvol=.90,atr_stop=1.35,risk_pct=.016,sl1_r=.55,sl1_fraction=.22,tp1_r=.65,tp2_r=1.30,tp3_r=2.4,tp1_fraction=.30,tp2_fraction=.30,breakeven_trigger_r=.72,trail_start_r=1.05,trail_r=.78),"15m",("15m","1H"),.57,.65,.71),
 ]
