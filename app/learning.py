@@ -14,7 +14,7 @@ SPECIFIC_BOUNDS={
  "vwap_ema":{"rsi_long":(44,62),"retest_lookback":(2,10),"atr_stop":(.75,2.2)},
  "mean_reversion":{"max_adx":(12,30),"max_context_adx":(14,32),"z":(1.15,3.0),"rsi_low":(22,42),"atr_stop":(.90,2.8)},
  "orderbook":{"imbalance":(.06,.48),"max_spread":(.0004,.0032),"min_rvol":(.55,1.9),"atr_stop":(.55,2.1)},
- "liquidation_magnet":{"strength_ratio":(1.02,3.2),"max_rsi":(56,82),"min_cluster_atr":(.05,1.2),"max_cluster_atr":(2.0,12.0),"atr_stop":(.80,2.6)},
+ "liquidation_magnet":{"strength_ratio":(1.02,3.2),"max_rsi":(56,82),"min_cluster_atr":(.05,1.2),"max_cluster_atr":(2.0,12.0),"min_liq_spike":(.70,3.5),"atr_stop":(.80,2.6)},
  "loser_rebound_cycle":{"rank_max":(5,35),"min_drop_pct":(.06,.30),"base_lookback":(6,28),"min_rvol":(.60,1.8),"rebound_rsi":(28,52),"rejection_rsi":(36,64),"continuation_rvol":(.55,1.8),"atr_stop":(.80,2.6)},
  "gainer_pullback_cycle":{"rank_max":(5,35),"min_gain_pct":(.06,.30),"swing_lookback":(6,28),"exhaustion_rsi":(62,86),"exhaustion_rvol":(.75,2.5),"continuation_rsi":(46,68),"continuation_rvol":(.55,1.8),"atr_stop":(.80,2.6)},
 }
@@ -67,7 +67,7 @@ def exit_quality(d):
     bad=sum(d["ratios"].get(k,0) for k in ["PARTIAL_SL_TOO_EARLY_CANDIDATE","STOP_TOO_TIGHT_CANDIDATE","TRAIL_OR_BE_TOO_TIGHT_CANDIDATE","TP_TOO_EARLY_CANDIDATE","TP_TOO_FAR_OR_GIVEBACK","LOW_EXIT_CAPTURE"]);return d["avg_capture"]-.20*bad
 
 def learning_progress(trades,m,diag):
-    """Live-readiness maturity recalculated from current evidence; it intentionally can move backwards."""
+    """Live readiness maturity, recalculated from current evidence; it intentionally can move backwards."""
     n=m["n"];days=sample_days(trades);rw=robust_windows(trades);syms=symbol_count(trades);conc=profit_concentration(trades) if trades else 1.
     def cap(x):return max(0.,min(1.,x))
     sample=cap(n/max(settings.final_min_trades,1));age=cap(days/max(settings.final_min_days,1));pf=cap(m["pf"]/max(settings.final_min_pf,1e-9));spf=cap(m["stress_pf"]/max(settings.final_min_stress_pf,1e-9));exp=cap(.5+m["avg_r"]/.5) if n else 0;dd=cap(1-m["max_dd_pct"]/max(settings.final_max_dd_pct*1.8,.01)) if n>=10 else 0.;rob=cap(rw/max(settings.final_min_robust_windows,1e-9));div=cap(syms/max(settings.final_min_symbols,1));con=cap((1-conc)/max(1-settings.final_max_symbol_profit_share,1e-9)) if n>=20 else 0.;post=cap(diag["n"]/max(settings.post_trade_min_studies*2,1))
