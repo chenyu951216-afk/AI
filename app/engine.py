@@ -7,7 +7,9 @@ from .live import live_adapter
 from .market import market
 from .paper import paper_broker
 from .strategies import SPECS,SPEC_MAP,build_strategy,min_score
+from .historical_replay import historical_replay
 
+# Intentionally retained: adding replay/AI support must not wipe existing forward-paper evidence.
 MODEL_VERSION="2026-08-08-11strategies-independent-entry-exit-rank-cgflow-v5"
 
 class Engine:
@@ -35,6 +37,7 @@ class Engine:
         need_depth=any(s["strategy"]=="orderbook" for s in states);need_liq=cg_allowed and any(s["strategy"]=="liquidation_magnet" for s in states);need_cg=cg_allowed and any(s["strategy"]=="oi_trend" for s in states)
         snap=await market.snapshot(symbol,need_depth,need_liq,need_cg)
         if not snap:return
+        historical_replay.archive_snapshot(snap)
         paper_broker.observe_snapshot(snap)
         if live_adapter.credentials_ready():
             try:await live_adapter.sync_from_paper_for_symbol(symbol)
