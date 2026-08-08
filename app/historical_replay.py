@@ -12,7 +12,7 @@ from .risk import COMMON_BOUNDS,risk_manager
 from .strategies import SPEC_MAP,build_strategy,min_score
 from .learning import SPECIFIC_BOUNDS,STOP_PARAM,SIZING,EXITS,INT_KEYS
 
-REPLAY_MODEL_VERSION="walk-forward-v2-strict-asof-forward-settlement"
+REPLAY_MODEL_VERSION="walk-forward-v3-strict-asof-spread"
 ARCHIVE_REQUIRED={"oi_trend","funding_squeeze","orderbook","liquidation_magnet"}
 RANK_REPLAY={"loser_rebound_cycle","gainer_pullback_cycle"}
 AI_OWN_HISTORY={"ai_extreme_hunter"}
@@ -63,10 +63,12 @@ class HistoricalReplayLab:
     def _ensure_schema(self):
         db.execute("""CREATE TABLE IF NOT EXISTS replay_feature_archive(
             symbol TEXT NOT NULL,ts INTEGER NOT NULL,funding REAL,oi REAL,oi_change_30m REAL,
-            orderbook_imbalance REAL,liquidation_mode TEXT,liquidation_above REAL,liquidation_below REAL,
+            orderbook_imbalance REAL,spread REAL,liquidation_mode TEXT,liquidation_above REAL,liquidation_below REAL,
             liquidation_above_strength REAL,liquidation_below_strength REAL,liquidation_long_usd REAL,
             liquidation_short_usd REAL,liquidation_spike_ratio REAL,change24h REAL,gainer_rank INTEGER,
             loser_rank INTEGER,PRIMARY KEY(symbol,ts))""")
+        cols={r["name"] for r in db.query("PRAGMA table_info(replay_feature_archive)")}
+        if "spread" not in cols:db.execute("ALTER TABLE replay_feature_archive ADD COLUMN spread REAL")
         db.execute("""CREATE TABLE IF NOT EXISTS replay_runs(
             id INTEGER PRIMARY KEY AUTOINCREMENT,strategy TEXT NOT NULL,domain TEXT NOT NULL,status TEXT NOT NULL,
             data_quality TEXT NOT NULL,window_start INTEGER NOT NULL,window_end INTEGER NOT NULL,symbols_json TEXT NOT NULL,
@@ -92,7 +94,7 @@ class HistoricalReplayLab:
             await asyncio.sleep(max(30,settings.historical_replay_sleep_sec))
     def archive_snapshot(self,snap:MarketSnapshot):
         try:
-            ts=int(snap.closed_ts("5m"));db.execute("""INSERT OR REPLACE INTO replay_feature_archive(symbol,ts,funding,oi,oi_change_30m,orderbook_imbalance,liquidation_mode,liquidation_above,liquidation_below,liquidation_above_strength,liquidation_below_strength,liquidation_long_usd,liquidation_short_usd,liquidation_spike_ratio,change24h,gainer_rank,loser_rank)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(snap.symbol,ts,snap.funding,snap.oi,snap.oi_change_30m,snap.orderbook_imbalance,snap.liquidation_mode,snap.liquidation_above,snap.liquidation_below,snap.liquidation_above_strength,snap.liquidation_below_strength,snap.liquidation_long_usd,snap.liquidation_short_usd,snap.liquidation_spike_ratio,snap.change24h,snap.gainer_rank,snap.loser_rank))
+            ts=int(snap.closed_ts("5m"));spread=(float(snap.ask)-float(snap.bid))/max(float(snap.price),1e-12);db.execute("""INSERT OR REPLACE INTO replay_feature_archive(symbol,ts,funding,oi,oi_change_30m,orderbook_imbalance,spread,liquidation_mode,liquidation_above,liquidation_below,liquidation_above_strength,liquidation_below_strength,liquidation_long_usd,liquidation_short_usd,liquidation_spike_ratio,change24h,gainer_rank,loser_rank)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(snap.symbol,ts,snap.funding,snap.oi,snap.oi_change_30m,snap.orderbook_imbalance,spread,snap.liquidation_mode,snap.liquidation_above,snap.liquidation_below,snap.liquidation_above_strength,snap.liquidation_below_strength,snap.liquidation_long_usd,snap.liquidation_short_usd,snap.liquidation_spike_ratio,snap.change24h,snap.gainer_rank,snap.loser_rank))
         except Exception:pass
     def status(self):
         latest=db.one("SELECT * FROM replay_runs ORDER BY started_at DESC LIMIT 1");ready=int((db.one("SELECT COUNT(*)n FROM replay_proposals WHERE status='READY'") or {"n":0})["n"]);archive=int((db.one("SELECT COUNT(*)n FROM replay_feature_archive") or {"n":0})["n"])
@@ -114,8 +116,9 @@ class HistoricalReplayLab:
             return await self.run_strategy(name)
         return None
     def _archive_ready(self,name):
-        col={"oi_trend":"oi_change_30m","funding_squeeze":"oi_change_30m","orderbook":"orderbook_imbalance","liquidation_magnet":"liquidation_mode"}[name]
-        q="SELECT COUNT(*)n FROM replay_feature_archive WHERE liquidation_mode IS NOT NULL AND liquidation_mode!='NONE'" if col=="liquidation_mode" else f"SELECT COUNT(*)n FROM replay_feature_archive WHERE {col} IS NOT NULL"
+        if name=="orderbook":q="SELECT COUNT(*)n FROM replay_feature_archive WHERE orderbook_imbalance IS NOT NULL AND spread IS NOT NULL"
+        elif name=="liquidation_magnet":q="SELECT COUNT(*)n FROM replay_feature_archive WHERE liquidation_mode IS NOT NULL AND liquidation_mode!='NONE'"
+        else:q="SELECT COUNT(*)n FROM replay_feature_archive WHERE oi_change_30m IS NOT NULL"
         return int((db.one(q) or {"n":0})["n"])>=settings.historical_replay_min_archive_rows
     def _log_skip(self,name,status,reason):
         last=db.one("SELECT * FROM replay_runs WHERE strategy=? ORDER BY started_at DESC LIMIT 1",(name,));now=int(time.time()*1000)
@@ -184,8 +187,7 @@ class HistoricalReplayLab:
         return out
     def _proposal(self,name,domain,base,params,cmp,now):
         state=db.state(name);current=risk_manager.sanitize(json.loads(state["params_json"]),state["stage"])
-        if current!=base:
-            db.log_adjustment(name,"historical_replay_stale",base,params,"Replay finished after Champion changed; candidate discarded instead of mixing evidence.",False);return
+        if current!=base:db.log_adjustment(name,"historical_replay_stale",base,params,"Replay finished after Champion changed; candidate discarded instead of mixing evidence.",False);return
         same=db.one("SELECT id FROM replay_proposals WHERE strategy=? AND status IN ('READY','SEEDED') AND params_json=?",(name,json.dumps(params)))
         if same:return
         reason=f"Walk-forward replay pretraining only; no-lookahead folds={cmp['folds_good']}/{cmp['folds_total']} scoreΔ={cmp['delta']:.3f} confidence={cmp['confidence']:.2f}. Historical evidence NEVER counts toward FINAL."
@@ -227,11 +229,11 @@ class HistoricalReplayLab:
             sf[tf]=z.iloc[-320:].copy()
         x=sf[SPEC_MAP[name].signal_tf].iloc[-1];price=float(x.close);rank=rank_cache.get(decision_close,{}).get(symbol,(0.,0,0));arch=self._archive_at(symbol,decision_close) if name in ARCHIVE_REQUIRED else None
         if name in ARCHIVE_REQUIRED and not arch:return None
-        funding=float((arch or {}).get("funding") or 0);oi=float((arch or {}).get("oi") or 0);oic=float((arch or {}).get("oi_change_30m") or 0);ob=(arch or {}).get("orderbook_imbalance");lm=str((arch or {}).get("liquidation_mode") or "NONE")
-        if name=="orderbook" and ob is None:return None
+        funding=float((arch or {}).get("funding") or 0);oi=float((arch or {}).get("oi") or 0);oic=float((arch or {}).get("oi_change_30m") or 0);ob=(arch or {}).get("orderbook_imbalance");spr=(arch or {}).get("spread");lm=str((arch or {}).get("liquidation_mode") or "NONE")
+        if name=="orderbook" and (ob is None or spr is None):return None
         if name=="liquidation_magnet" and lm=="NONE":return None
-        macro=self._macro(frames.get("BTCUSDT",{}),decision_close);reg=self._local_regime(sf);qv=float(sf["15m"].quote_volume.iloc[-96:].sum()) if "15m" in sf else 0
-        return MarketSnapshot(symbol,price,price,price,qv,sf,funding,oi,oic,reg,macro,float(ob) if ob is not None else None,(arch or {}).get("liquidation_above"),(arch or {}).get("liquidation_below"),float((arch or {}).get("liquidation_above_strength") or 0),float((arch or {}).get("liquidation_below_strength") or 0),None,float((arch or {}).get("liquidation_long_usd") or 0),float((arch or {}).get("liquidation_short_usd") or 0),float((arch or {}).get("liquidation_spike_ratio") or 0),lm,float(rank[0]),int(rank[1]),int(rank[2]),float(sf["15m"].high.iloc[-96:].max()),float(sf["15m"].low.iloc[-96:].min()))
+        spread=float(spr or 0);bid=price*(1-spread/2);ask=price*(1+spread/2);macro=self._macro(frames.get("BTCUSDT",{}),decision_close);reg=self._local_regime(sf);qv=float(sf["15m"].quote_volume.iloc[-96:].sum()) if "15m" in sf else 0
+        return MarketSnapshot(symbol,price,bid,ask,qv,sf,funding,oi,oic,reg,macro,float(ob) if ob is not None else None,(arch or {}).get("liquidation_above"),(arch or {}).get("liquidation_below"),float((arch or {}).get("liquidation_above_strength") or 0),float((arch or {}).get("liquidation_below_strength") or 0),None,float((arch or {}).get("liquidation_long_usd") or 0),float((arch or {}).get("liquidation_short_usd") or 0),float((arch or {}).get("liquidation_spike_ratio") or 0),lm,float(rank[0]),int(rank[1]),int(rank[2]),float(sf["15m"].high.iloc[-96:].max()),float(sf["15m"].low.iloc[-96:].min()))
     def _simulate(self,name,params,stage,symbols,frames,start,decision_end,fetch_end):
         spec=SPEC_MAP[name];tf=spec.signal_tf;params=risk_manager.sanitize(params,stage);events={};rank_cache=self._rank_series(symbols,frames) if name in RANK_REPLAY else {}
         for s in symbols:
