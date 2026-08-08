@@ -1,0 +1,34 @@
+name: smoke-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Compile
+        run: python -m compileall -q app
+      - name: Import smoke
+        env:
+          DB_PATH: /tmp/crypto-lab-ci.db
+          LIVE_TRADING_ALLOWED: 'false'
+          COINGLASS_ENABLED: 'false'
+          DISCORD_DAILY_REPORT_ENABLED: 'false'
+          HISTORICAL_REPLAY_ENABLED: 'false'
+        run: |
+          python - <<'PY'
+          import app.main
+          from app.strategies import SPECS
+          assert len(SPECS) == 12, len(SPECS)
+          print('smoke ok')
+          PY
