@@ -12,8 +12,9 @@ from .live import live_adapter
 from .market import market
 from .risk import risk_manager
 from .strategies import SPEC_MAP
+from .ai_hunter import ai_hunter
 
-app=FastAPI(title="AI Crypto Strategy Lab",version="2026.08.08-big-opt")
+app=FastAPI(title="AI Crypto Strategy Lab",version="2026.08.08-ai-extreme-hunter")
 app.mount("/static",StaticFiles(directory=os.path.join(os.path.dirname(os.path.dirname(__file__)),"static")),name="static")
 @app.on_event("startup")
 async def startup():await engine.start()
@@ -32,8 +33,8 @@ def strategy_rows():
         challenger=None
         if c:
             ct=completed_roundtrips(s["strategy"],"challenger",10000,int(c["started_at"]));cm=metrics(ct);challenger={"domain":c.get("domain"),"started_at":c["started_at"],"trades":cm["n"],"pf":round(cm["pf"],2),"expectancy":round(cm["expectancy"],2),"dd_pct":round(cm["max_dd_pct"]*100,2),"params":json.loads(c["params_json"]),"reason":c["reason"]}
-        spec=SPEC_MAP[s["strategy"]];params=json.loads(s["params_json"]);data_health=cg if s["strategy"]=="liquidation_magnet" else None
-        out.append({"strategy":s["strategy"],"name":s["display_name"],"description":s["description"],"signal_tf":spec.signal_tf,"context_tfs":spec.context_tfs,"stage":s["stage"],"enabled":bool(s["enabled"]),"balance":round(float(acc["balance"] if acc else 0),2),"equity":round(eq,2),"return_pct":round((eq/float(acc["initial_balance"])-1)*100,2) if acc else 0,"open_positions":opens,"trades":m["n"],"win_rate":round(m["win_rate"]*100,1),"profit_factor":round(m["pf"],2),"expectancy":round(m["expectancy"],2),"avg_r":round(m["avg_r"],3),"max_dd_pct":round(m["max_dd_pct"]*100,2),"stress_pf":round(m["stress_pf"],2),"robust_windows":round(robust_windows(tr),2),"days":round(sample_days(tr),1),"symbols":symbol_count(tr),"profit_concentration":round(profit_concentration(tr)*100,1) if tr else 0,"live_eligible":bool(s["live_eligible"]),"live_manual_enabled":bool(s.get("live_manual_enabled")),"params":params,"exit_profile":_exit_profile(params),"challenger":challenger,"exit_lab":diag,"learning_progress":progress,"data_health":data_health})
+        spec=SPEC_MAP[s["strategy"]];params=json.loads(s["params_json"]);data_health=cg if s["strategy"]=="liquidation_magnet" else None;ai_model=ai_hunter.status() if s["strategy"]=="ai_extreme_hunter" else None
+        out.append({"strategy":s["strategy"],"name":s["display_name"],"description":s["description"],"signal_tf":spec.signal_tf,"context_tfs":spec.context_tfs,"stage":s["stage"],"enabled":bool(s["enabled"]),"balance":round(float(acc["balance"] if acc else 0),2),"equity":round(eq,2),"return_pct":round((eq/float(acc["initial_balance"])-1)*100,2) if acc else 0,"open_positions":opens,"trades":m["n"],"win_rate":round(m["win_rate"]*100,1),"profit_factor":round(m["pf"],2),"expectancy":round(m["expectancy"],2),"avg_r":round(m["avg_r"],3),"max_dd_pct":round(m["max_dd_pct"]*100,2),"stress_pf":round(m["stress_pf"],2),"robust_windows":round(robust_windows(tr),2),"days":round(sample_days(tr),1),"symbols":symbol_count(tr),"profit_concentration":round(profit_concentration(tr)*100,1) if tr else 0,"live_eligible":bool(s["live_eligible"]),"live_manual_enabled":bool(s.get("live_manual_enabled")),"params":params,"exit_profile":_exit_profile(params),"challenger":challenger,"exit_lab":diag,"learning_progress":progress,"data_health":data_health,"ai_model":ai_model})
     return out
 
 def position_rows():
@@ -68,6 +69,8 @@ def live_protections(limit:int=200):return db.query("SELECT p.*,o.strategy,o.sym
 @app.get("/api/live/status")
 def live_status():
     x=live_adapter.gate_status();x.update({"last_reconcile":int(live_adapter.last_sync*1000) if live_adapter.last_sync else None,"reconcile_error":live_adapter.last_sync_error,"exchange_positions":len(live_adapter.last_positions)});return x
+@app.get("/api/ai-hunter/status")
+def ai_hunter_status():return ai_hunter.status()
 @app.get("/api/daily")
 def daily():
     rows=db.query("""SELECT strategy,date(closed_at/1000,'unixepoch','+8 hours')day,COUNT(*)trades,SUM(CASE WHEN net_pnl>0 THEN 1 ELSE 0 END)wins,SUM(net_pnl)pnl FROM (SELECT t.position_id,t.strategy,MAX(t.closed_at)closed_at,SUM(t.net_pnl)net_pnl FROM trades t WHERE t.variant='champion' AND NOT EXISTS(SELECT 1 FROM positions p WHERE p.id=t.position_id) GROUP BY t.position_id,t.strategy)x GROUP BY strategy,day ORDER BY day DESC,strategy LIMIT 1000""")
@@ -97,6 +100,6 @@ def strategy_live_toggle(name:str,body:Toggle,r:Request):
     if body.enabled and (s["stage"]!="FINAL" or not s["live_eligible"] or not s["enabled"]):raise HTTPException(409,"Only enabled FINAL/live-eligible strategies can be manually approved")
     db.update_strategy(name,live_manual_enabled=body.enabled);db.event("STRATEGY_LIVE_APPROVAL",f"{name} -> {body.enabled}","WARN" if body.enabled else "INFO");return {"strategy":name,"live_manual_enabled":body.enabled}
 @app.get("/api/config/public")
-def public_config():return {"scan_interval_sec":settings.scan_interval_sec,"initial_paper_equity":settings.initial_paper_equity,"closed_candle_safety_ms":settings.closed_candle_safety_ms,"post_trade_follow_bars":settings.post_trade_follow_bars,"live_trading_allowed":settings.live_trading_allowed,"live_base_risk_pct":settings.live_base_risk_pct,"live_max_total_notional_multiple":settings.live_max_total_notional_multiple,"admin_token_configured":bool(settings.admin_token),"bitget_credentials_configured":live_adapter.credentials_ready(),"coinglass":market.cg.health()}
+def public_config():return {"scan_interval_sec":settings.scan_interval_sec,"initial_paper_equity":settings.initial_paper_equity,"closed_candle_safety_ms":settings.closed_candle_safety_ms,"post_trade_follow_bars":settings.post_trade_follow_bars,"live_trading_allowed":settings.live_trading_allowed,"live_base_risk_pct":settings.live_base_risk_pct,"live_max_total_notional_multiple":settings.live_max_total_notional_multiple,"admin_token_configured":bool(settings.admin_token),"bitget_credentials_configured":live_adapter.credentials_ready(),"coinglass":market.cg.health(),"ai_hunter":ai_hunter.status()}
 @app.get("/health")
-def health():return {"ok":True,"time":int(time.time()*1000),"engine":engine.running,"last_error":engine.last_error,"coinglass":market.cg.health()}
+def health():return {"ok":True,"time":int(time.time()*1000),"engine":engine.running,"last_error":engine.last_error,"coinglass":market.cg.health(),"ai_hunter_ready":ai_hunter.status()["ready"]}
