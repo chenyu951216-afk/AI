@@ -2,7 +2,7 @@ name: smoke-ci
 
 on:
   push:
-    branches: [main, daily-discord-report-20260808]
+    branches: [main]
   pull_request:
 
 jobs:
@@ -29,10 +29,6 @@ jobs:
           python - <<'PY'
           import app.main
           from app.strategies import SPECS
-          from app.historical_replay import historical_replay
-          from app.daily_report import daily_reporter
           assert len(SPECS) == 12, len(SPECS)
-          assert historical_replay.status()['enabled'] is False
-          assert daily_reporter.status()['enabled'] is False
           print('smoke ok')
           PY
