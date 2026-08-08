@@ -17,6 +17,7 @@ SPECIFIC_BOUNDS={
  "liquidation_magnet":{"strength_ratio":(1.02,3.2),"max_rsi":(56,82),"min_cluster_atr":(.05,1.2),"max_cluster_atr":(2.0,12.0),"min_liq_spike":(.70,3.5),"atr_stop":(.80,2.6)},
  "loser_rebound_cycle":{"rank_max":(5,35),"min_drop_pct":(.06,.30),"base_lookback":(6,28),"min_rvol":(.60,1.8),"rebound_rsi":(28,52),"rejection_rsi":(36,64),"continuation_rvol":(.55,1.8),"atr_stop":(.80,2.6)},
  "gainer_pullback_cycle":{"rank_max":(5,35),"min_gain_pct":(.06,.30),"swing_lookback":(6,28),"exhaustion_rsi":(62,86),"exhaustion_rvol":(.75,2.5),"continuation_rsi":(46,68),"continuation_rvol":(.55,1.8),"atr_stop":(.80,2.6)},
+ "ai_extreme_hunter":{"ai_confidence_floor":(.05,.55),"atr_stop":(.80,3.0)},
 }
 STOP_PARAM={k:"atr_stop" for k in SPECIFIC_BOUNDS};STOP_PARAM["smc_liquidity"]="atr_buffer";STOP_PARAM["fib_pullback"]="stop_buffer_atr"
 SIZING=["risk_pct","leverage","max_positions","max_position_notional_pct","max_symbol_exposure_pct","max_total_exposure_pct"]
@@ -67,7 +68,6 @@ def exit_quality(d):
     bad=sum(d["ratios"].get(k,0) for k in ["PARTIAL_SL_TOO_EARLY_CANDIDATE","STOP_TOO_TIGHT_CANDIDATE","TRAIL_OR_BE_TOO_TIGHT_CANDIDATE","TP_TOO_EARLY_CANDIDATE","TP_TOO_FAR_OR_GIVEBACK","LOW_EXIT_CAPTURE"]);return d["avg_capture"]-.20*bad
 
 def learning_progress(trades,m,diag):
-    """Live readiness maturity, recalculated from current evidence; it intentionally can move backwards."""
     n=m["n"];days=sample_days(trades);rw=robust_windows(trades);syms=symbol_count(trades);conc=profit_concentration(trades) if trades else 1.
     def cap(x):return max(0.,min(1.,x))
     sample=cap(n/max(settings.final_min_trades,1));age=cap(days/max(settings.final_min_days,1));pf=cap(m["pf"]/max(settings.final_min_pf,1e-9));spf=cap(m["stress_pf"]/max(settings.final_min_stress_pf,1e-9));exp=cap(.5+m["avg_r"]/.5) if n else 0;dd=cap(1-m["max_dd_pct"]/max(settings.final_max_dd_pct*1.8,.01)) if n>=10 else 0.;rob=cap(rw/max(settings.final_min_robust_windows,1e-9));div=cap(syms/max(settings.final_min_symbols,1));con=cap((1-conc)/max(1-settings.final_max_symbol_profit_share,1e-9)) if n>=20 else 0.;post=cap(diag["n"]/max(settings.post_trade_min_studies*2,1))
@@ -137,6 +137,7 @@ class LearningGovernor:
         after=risk_manager.sanitize(after,s["stage"])
         if after==before:return []
         now=int(time.time()*1000);why=f"domain={domain}; own-strategy closed-K challenger; "+"; ".join(reason)
+        if s["strategy"]=="ai_extreme_hunter" and domain=="entry":why+="; online AI model weights learn continuously; challenger only validates AI confidence policy"
         if domain=="exit":why+=f"; post-trade n={diag['n']} capture={diag['avg_capture']:.2f} ratios={diag['ratios']}"
         db.execute("INSERT OR REPLACE INTO challengers(strategy,status,domain,params_json,baseline_json,reason,started_at,updated_at)VALUES(?,?,?,?,?,?,?,?)",(s["strategy"],"ACTIVE",domain,json.dumps(after),json.dumps(before),why,now,now));db.execute("DELETE FROM positions WHERE strategy=? AND variant='challenger'",(s["strategy"],));db.ensure_account(s["strategy"],"challenger",reset=True);db.log_adjustment(s["strategy"],"challenger_started",before,after,why,False);return [{"strategy":s["strategy"],"challenger":"started","domain":domain,"changes":reason}]
     def _review(self,s,c):
