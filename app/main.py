@@ -13,11 +13,13 @@ from .market import market
 from .risk import risk_manager
 from .strategies import SPEC_MAP
 from .ai_hunter import ai_hunter
+from .daily_report import daily_reporter
 
-app=FastAPI(title="AI Crypto Strategy Lab",version="2026.08.08-ai-extreme-hunter")
+app=FastAPI(title="AI Crypto Strategy Lab",version="2026.08.08-daily-discord-report")
 app.mount("/static",StaticFiles(directory=os.path.join(os.path.dirname(os.path.dirname(__file__)),"static")),name="static")
 @app.on_event("startup")
-async def startup():await engine.start()
+async def startup():
+    await engine.start();await daily_reporter.start()
 def admin(r:Request):
     if not settings.admin_token:raise HTTPException(503,"ADMIN_TOKEN is not configured")
     if r.headers.get("x-admin-token","")!=settings.admin_token:raise HTTPException(403,"bad admin token")
@@ -47,7 +49,7 @@ def position_rows():
 def home():return open(os.path.join(os.path.dirname(os.path.dirname(__file__)),"templates","index.html"),encoding="utf-8").read()
 @app.get("/api/overview")
 def overview():
-    now=int(time.time()*1000);day=now-86400000;p=(db.one("SELECT COALESCE(SUM(net_pnl),0)x FROM trades WHERE variant='champion' AND closed_at>=?",(day,)) or {"x":0})["x"];reg=db.one("SELECT * FROM regime_history ORDER BY ts DESC LIMIT 1");cg=market.cg.health();return {"running":engine.running,"last_scan":engine.last_scan,"last_error":engine.last_error,"scan_count":engine.scan_count,"universe_size":len(engine.universe),"strategy_count":len(SPEC_MAP),"daily_realized_pnl":round(float(p),2),"coinglass_connected":cg["ok"],"coinglass":cg,"macro":reg or {"regime":"NEUTRAL"},"live":live_adapter.gate_status()}
+    now=int(time.time()*1000);day=now-86400000;p=(db.one("SELECT COALESCE(SUM(net_pnl),0)x FROM trades WHERE variant='champion' AND closed_at>=?",(day,)) or {"x":0})["x"];reg=db.one("SELECT * FROM regime_history ORDER BY ts DESC LIMIT 1");cg=market.cg.health();return {"running":engine.running,"last_scan":engine.last_scan,"last_error":engine.last_error,"scan_count":engine.scan_count,"universe_size":len(engine.universe),"strategy_count":len(SPEC_MAP),"daily_realized_pnl":round(float(p),2),"coinglass_connected":cg["ok"],"coinglass":cg,"macro":reg or {"regime":"NEUTRAL"},"live":live_adapter.gate_status(),"daily_report":daily_reporter.status()}
 @app.get("/api/strategies")
 def strategies():return strategy_rows()
 @app.get("/api/positions")
@@ -71,6 +73,10 @@ def live_status():
     x=live_adapter.gate_status();x.update({"last_reconcile":int(live_adapter.last_sync*1000) if live_adapter.last_sync else None,"reconcile_error":live_adapter.last_sync_error,"exchange_positions":len(live_adapter.last_positions)});return x
 @app.get("/api/ai-hunter/status")
 def ai_hunter_status():return ai_hunter.status()
+@app.get("/api/daily-report/status")
+def daily_report_status():return daily_reporter.status()
+@app.post("/api/daily-report/run")
+async def daily_report_run(r:Request):admin(r);return await daily_reporter.run_latest(force=True)
 @app.get("/api/daily")
 def daily():
     rows=db.query("""SELECT strategy,date(closed_at/1000,'unixepoch','+8 hours')day,COUNT(*)trades,SUM(CASE WHEN net_pnl>0 THEN 1 ELSE 0 END)wins,SUM(net_pnl)pnl FROM (SELECT t.position_id,t.strategy,MAX(t.closed_at)closed_at,SUM(t.net_pnl)net_pnl FROM trades t WHERE t.variant='champion' AND NOT EXISTS(SELECT 1 FROM positions p WHERE p.id=t.position_id) GROUP BY t.position_id,t.strategy)x GROUP BY strategy,day ORDER BY day DESC,strategy LIMIT 1000""")
@@ -100,6 +106,6 @@ def strategy_live_toggle(name:str,body:Toggle,r:Request):
     if body.enabled and (s["stage"]!="FINAL" or not s["live_eligible"] or not s["enabled"]):raise HTTPException(409,"Only enabled FINAL/live-eligible strategies can be manually approved")
     db.update_strategy(name,live_manual_enabled=body.enabled);db.event("STRATEGY_LIVE_APPROVAL",f"{name} -> {body.enabled}","WARN" if body.enabled else "INFO");return {"strategy":name,"live_manual_enabled":body.enabled}
 @app.get("/api/config/public")
-def public_config():return {"scan_interval_sec":settings.scan_interval_sec,"initial_paper_equity":settings.initial_paper_equity,"closed_candle_safety_ms":settings.closed_candle_safety_ms,"post_trade_follow_bars":settings.post_trade_follow_bars,"live_trading_allowed":settings.live_trading_allowed,"live_base_risk_pct":settings.live_base_risk_pct,"live_max_total_notional_multiple":settings.live_max_total_notional_multiple,"admin_token_configured":bool(settings.admin_token),"bitget_credentials_configured":live_adapter.credentials_ready(),"coinglass":market.cg.health(),"ai_hunter":ai_hunter.status()}
+def public_config():return {"scan_interval_sec":settings.scan_interval_sec,"initial_paper_equity":settings.initial_paper_equity,"closed_candle_safety_ms":settings.closed_candle_safety_ms,"post_trade_follow_bars":settings.post_trade_follow_bars,"live_trading_allowed":settings.live_trading_allowed,"live_base_risk_pct":settings.live_base_risk_pct,"live_max_total_notional_multiple":settings.live_max_total_notional_multiple,"admin_token_configured":bool(settings.admin_token),"bitget_credentials_configured":live_adapter.credentials_ready(),"coinglass":market.cg.health(),"ai_hunter":ai_hunter.status(),"daily_report":{"enabled":settings.discord_daily_report_enabled,"configured":bool(settings.discord_webhook_url),"hour":settings.daily_report_hour,"minute":settings.daily_report_minute,"timezone":settings.timezone}}
 @app.get("/health")
-def health():return {"ok":True,"time":int(time.time()*1000),"engine":engine.running,"last_error":engine.last_error,"coinglass":market.cg.health(),"ai_hunter_ready":ai_hunter.status()["ready"]}
+def health():return {"ok":True,"time":int(time.time()*1000),"engine":engine.running,"last_error":engine.last_error,"coinglass":market.cg.health(),"ai_hunter_ready":ai_hunter.status()["ready"],"daily_report":daily_reporter.status()}
