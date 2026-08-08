@@ -1,0 +1,38 @@
+name: smoke-ci
+
+on:
+  push:
+    branches: [main, daily-discord-report-20260808]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Compile
+        run: python -m compileall -q app
+      - name: Import smoke
+        env:
+          DB_PATH: /tmp/crypto-lab-ci.db
+          LIVE_TRADING_ALLOWED: 'false'
+          COINGLASS_ENABLED: 'false'
+          DISCORD_DAILY_REPORT_ENABLED: 'false'
+          HISTORICAL_REPLAY_ENABLED: 'false'
+        run: |
+          python - <<'PY'
+          import app.main
+          from app.strategies import SPECS
+          from app.historical_replay import historical_replay
+          from app.daily_report import daily_reporter
+          assert len(SPECS) == 12, len(SPECS)
+          assert historical_replay.status()['enabled'] is False
+          assert daily_reporter.status()['enabled'] is False
+          print('smoke ok')
+          PY
