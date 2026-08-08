@@ -22,6 +22,11 @@ class Settings:
     log_level: str = os.getenv("LOG_LEVEL","INFO")
     admin_token: str = os.getenv("ADMIN_TOKEN","")
 
+    discord_daily_report_enabled: bool = _b("DISCORD_DAILY_REPORT_ENABLED",False)
+    discord_webhook_url: str = os.getenv("DISCORD_WEBHOOK_URL","")
+    daily_report_hour: int = _i("DAILY_REPORT_HOUR",17)
+    daily_report_minute: int = _i("DAILY_REPORT_MINUTE",0)
+
     scan_interval_sec: int = _i("SCAN_INTERVAL_SEC",30)
     scan_symbols_per_cycle: int = _i("SCAN_SYMBOLS_PER_CYCLE",36)
     universe_min_usdt_volume: float = _f("UNIVERSE_MIN_USDT_VOLUME",1_500_000)
