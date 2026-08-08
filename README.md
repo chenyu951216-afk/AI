@@ -1,16 +1,16 @@
 # AI Crypto Strategy Lab
 
-多策略加密貨幣 forward-paper research / learning / Bitget live-execution 平台。部署目標為 Zeabur，網站 Port 8080。
+多策略加密貨幣 forward-paper research / learning / Bitget live-execution 平台。部署目標 Zeabur，網站 Port 8080。
 
 ## 核心規則
 
-- **所有 K 線判斷只允許 fully closed candles。** 資料層會先丟掉尚未走完整個 timeframe 的 K；策略、學習、post-trade review 都拿不到未收 K。
-- 不同策略使用不同主週期：SMC/OI/Funding/Volume/Fib/Liquidation 主判斷 15m；VWAP/EMA、Mean Reversion、Orderbook 主判斷 5m；各自再讀 15m/1H/4H context。
-- BTC 大盤只做很小的 score nudge，不是 hard gate。每顆幣的 local regime 由自己的已收 1H/4H 判斷。
-- 每套策略各自 10,000U paper account，資料、交易、post-trade study、Champion/Challenger 完全依 strategy namespace 隔離，不互相借資料。
-- EARLY 初始門檻刻意較積極收集樣本；TUNING/FINAL 才逐步收斂與降風險。
+- **所有 K 線判斷與 AI 訓練樣本只允許 fully closed candles。** 未收 K 在資料層就被排除。
+- 不同策略使用自己的最適週期；BTC 只做很小的 score nudge，不是 hard gate。
+- 每套策略各自 10,000U paper account，交易、Post-Trade、Champion/Challenger 依 strategy namespace 隔離。
+- 每套一般策略都有 `ENTRY / EXIT / SIZING` 三個獨立學習域；一次只測一個領域。
+- 真實交易共用同一 Bitget 帳戶，但實際 notional 由 Shared Live Portfolio Allocator 統一決定；策略仍保留自己的進場、SL/TP/BE/trailing。
 
-## 9 套策略
+## 12 套策略
 
 1. SMC liquidity sweep / reclaim
 2. OI trend expansion
@@ -20,62 +20,52 @@
 6. VWAP / EMA momentum
 7. Mean reversion
 8. Orderbook imbalance
-9. CoinGlass liquidation magnet
+9. CoinGlass liquidation flow / magnet
+10. 跌幅榜反彈循環：極端跌幅止跌做多，反彈失敗後可續空
+11. 漲幅榜回踩循環：極端漲幅衰竭做空，回踩守住後可續多
+12. **AI 十倍極端行情獵手**：獨立 Online Tail Model，從全市場已收 15m K 自己學極端上漲與極端下跌前兆，多空模型分開更新
+
+## AI 十倍極端行情獵手
+
+這套策略的方向與候選訊號不依賴固定 RSI/EMA 進場規則。系統從每個已收 15m K 保存當下市場特徵，等後續 24 小時完整走完後再建立 future label，避免未來資料洩漏。
+
+Long target 使用未來最大上漲的 log-tail；價格約 10x 時 target 約為 1。Short target 使用未來最大下跌的 log-tail；價格約跌 90% 時 target 約為 1。真正的 2x/5x/10x 或極端崩跌樣本權重最高，但模型也會從 15%/30%/50% 等較常見的爆發行情先學到前兆，不必等第一顆 literal 10x 才開始學。
+
+- Long / Short 模型完全分開。
+- 初次運行會從已經有完整未來路徑的歷史已收 K 做 bootstrap，因此不是從 0 樣本空等一天。
+- 新的已收 K 先成為 `PENDING`，滿 24h 後才正式 `LABELED` 並更新模型。
+- 模型權重持續在線更新；極端尾端樣本具有更高訓練權重。
+- AI 的入場信心門檻 `ai_confidence_floor` 仍由這套策略自己的 ENTRY Challenger 驗證，防止模型過度積極。
+- SL/SL1/TP1/TP2/TP3/BE/trailing 仍由這套策略自己的 EXIT learning 與 Post-Trade Lab 檢討。
+- SIZING 仍由自己的 Paper learning 驗證；進真錢後下多少 U 交給共用 Live Portfolio Allocator。
+- AI 模型資料表只屬於 `ai_extreme_hunter`，不借其他 11 套策略的交易成果。
+
+> 目標是尋找「10x-class tail opportunity」，不是保證能抓到十倍報酬。做空標的是極端下跌尾端，因標的價格本身最低只能跌到 0。
 
 ## Post-Trade Exit Lab
 
-完整平倉後不停止追蹤。系統會依該策略自己的 `signal_tf` 繼續保存後續已收 K，並比較：
+完整平倉後不停止追蹤。系統依該策略自己的主週期保存後續已收 K，檢查：部分 SL 是否太早、Full Stop 是否太緊/太寬、TP 是否太早/太遠、BE/trailing 是否反覆被洗掉、實際行情 capture 是否過低。只有累積足夠同策略證據才建立 EXIT Challenger。
 
-- 持倉內 MFE / MAE
-- 出場後延伸幅度
-- 實現 R 與 capture ratio
-- STOP_TOO_TIGHT_CANDIDATE
-- STOP_TOO_WIDE_OR_ENTRY_BAD
-- TRAIL_TOO_TIGHT_CANDIDATE
-- TP_TOO_EARLY_CANDIDATE
-- TP_TOO_FAR_OR_GIVEBACK
-- LOW_EXIT_CAPTURE
+## 真實交易 Gate
 
-單筆診斷不會直接改參數。只有同一策略累積足夠 post-trade studies 後，才建立 **exit-domain Challenger**。Challenger 一次只能屬於 `entry`、`exit`、`sizing` 其中一個 domain，避免把多種改動混在一起而學不出因果。
-
-## 真實交易
-
-Paper quantity **不會直接複製到真實帳戶**。FINAL 之後由 Shared Live Portfolio Allocator 讀取 Bitget 共用帳戶：
-
-- account equity / available margin
-- 全帳戶目前真實倉位與總 notional
-- 該策略自己的近期 PF / sample quality
-- 該筆策略自己的 stop distance
-- 共用帳戶 max concurrent positions / total notional ceiling / free margin reserve
-
-總機器人重新計算真實 notional；策略仍保有自己的 Entry / SL / TP / trailing 邏輯。
-
-### 真實交易需要全部 Gate
+真實下單必須全部成立：
 
 1. Strategy `FINAL`
 2. `live_eligible=true`
-3. 該策略網頁 **真實交易允許 = ON**（預設 OFF）
+3. 該策略網頁「真實交易允許」= ON
 4. Zeabur `LIVE_TRADING_ALLOWED=true`
 5. Bitget private credentials 完整
 6. 網頁頂部 LIVE Master = ON
 
 ## Bitget Protection Guardian
 
-入場 market order 先附 `presetStopLossPrice` + `presetStopSurplusPrice`，降低進場後短暫裸倉風險。成交後 Guardian 另外建立可追蹤/可修改的交易所 TP/SL：
-
-- Position STOP
-- TP1 partial
-- TP2 partial
-- Position TP3 runner
-
-並使用 Bitget pending-plan API 定期驗證。缺單會重試補掛；移動止損只在策略主週期 **已收 K** 更新後同步到 Bitget `modify-tpsl-order`。若關鍵 STOP 與至少一個 TP 經重試仍無法驗證，可設定自動 emergency close。
+真實下單後持續維護 Position STOP、部分 SL1、TP1、TP2、TP3，並讀 pending/history plan 驗證。已執行的部分保護單標記 `FILLED`，不會誤補掛；缺失或取消才修復。保本與 trailing 只在策略主週期已收 K 後更新。
 
 ## Zeabur
 
 1. 連接本 repo。
-2. 掛 Persistent Volume 到 `/data`。
-3. 複製 `.env.example` 到 Zeabur Environment Variables。
+2. Persistent Volume 掛到 `/data`。
+3. 使用 `.env.example` 對應 Environment Variables。
 4. `DB_PATH=/data/crypto_lab.db`。
-5. Paper 階段 `LIVE_TRADING_ALLOWED=false` 最安全；Bitget keys 可先留空。
 
-> 這是研究與自動執行系統，不保證獲利。FINAL 是統計/forward gate，不是獲利保證。
+> 研究與自動執行系統不保證獲利。FINAL 代表通過目前 forward evidence gate，不代表未來必然獲利。
