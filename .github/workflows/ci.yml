@@ -16,9 +16,11 @@ jobs:
           python-version: '3.12'
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Compile
+      - name: Compile Python
         run: python -m compileall -q app
-      - name: Import smoke
+      - name: Check frontend JS syntax
+        run: node --check static/app.js
+      - name: Import and API smoke
         env:
           DB_PATH: /tmp/crypto-lab-ci.db
           LIVE_TRADING_ALLOWED: 'false'
@@ -26,9 +28,29 @@ jobs:
           DISCORD_DAILY_REPORT_ENABLED: 'false'
           HISTORICAL_REPLAY_ENABLED: 'false'
         run: |
+          rm -f /tmp/crypto-lab-ci.db /tmp/crypto-lab-ci.db-shm /tmp/crypto-lab-ci.db-wal
           python - <<'PY'
-          import app.main
+          import time
+          import app.main as m
+          from app.db import db
           from app.strategies import SPECS
+
           assert len(SPECS) == 12, len(SPECS)
-          print('smoke ok')
+          assert isinstance(m.overview(), dict)
+          assert isinstance(m.strategies(), list)
+          assert isinstance(m.positions(), list)
+          assert isinstance(m.trades(5), list)
+          assert isinstance(m.signals(5), list)
+          assert isinstance(m.post_trade(5), list)
+          assert isinstance(m.storage_status(), dict)
+
+          # Regression: model-version transitions must NEVER erase paper evidence automatically.
+          now=int(time.time()*1000)
+          db.execute("INSERT INTO signals(strategy,variant,symbol,side,score,entry,stop,reason,features_json,regime,signal_tf,bar_ts,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",('smc_liquidity','champion','BTCUSDT','long',99,1,0.9,'ci','{}','NEUTRAL','15m',now,now))
+          before=(db.one("SELECT COUNT(*) n FROM signals") or {'n':0})['n']
+          db.runtime_set('research_model_version','ci-old-version')
+          db.reset_research_epoch(SPECS,'ci-new-version')
+          after=(db.one("SELECT COUNT(*) n FROM signals") or {'n':0})['n']
+          assert after == before, (before,after)
+          print('smoke ok', m.storage_status())
           PY
