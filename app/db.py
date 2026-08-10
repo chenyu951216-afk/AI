@@ -1,13 +1,14 @@
 from __future__ import annotations
-import json,os,sqlite3,threading,time
+import json,os,sqlite3,threading,time,uuid
 from typing import Any
 from .config import settings
 
 class DB:
     def __init__(self,path:str):
-        self.path=path;parent=os.path.dirname(path)
+        self.path=path;self.opened_at=int(time.time()*1000);self.was_missing=not os.path.exists(path)
+        parent=os.path.dirname(path)
         if parent:os.makedirs(parent,exist_ok=True)
-        self.conn=sqlite3.connect(path,check_same_thread=False);self.conn.row_factory=sqlite3.Row;self.lock=threading.RLock();self._archive_legacy_if_needed();self._init()
+        self.conn=sqlite3.connect(path,check_same_thread=False);self.conn.row_factory=sqlite3.Row;self.lock=threading.RLock();self._archive_legacy_if_needed();self._init();self._ensure_identity()
     def _archive_legacy_if_needed(self):
         try:
             tables={r[0] for r in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
@@ -45,10 +46,24 @@ class DB:
             CREATE TABLE IF NOT EXISTS system_events(id INTEGER PRIMARY KEY AUTOINCREMENT,level TEXT NOT NULL,kind TEXT NOT NULL,detail TEXT NOT NULL,created_at INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS idx_trades_sv ON trades(strategy,variant,closed_at);CREATE INDEX IF NOT EXISTS idx_post_sv ON post_trade_studies(strategy,variant,status,closed_at);CREATE INDEX IF NOT EXISTS idx_positions_sv ON positions(strategy,variant);CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at);CREATE INDEX IF NOT EXISTS idx_risk_created ON risk_events(created_at);
             """)
-            for table,name,ddl in [("strategy_state","live_manual_enabled","INTEGER NOT NULL DEFAULT 0"),("strategy_state","signal_tf","TEXT NOT NULL DEFAULT '15m'"),("challengers","domain","TEXT NOT NULL DEFAULT 'entry'"),("signals","signal_tf","TEXT NOT NULL DEFAULT '15m'"),("signals","bar_ts","INTEGER NOT NULL DEFAULT 0"),("positions","signal_tf","TEXT NOT NULL DEFAULT '15m'"),("positions","signal_bar_ts","INTEGER NOT NULL DEFAULT 0"),("positions","params_json","TEXT NOT NULL DEFAULT '{}'"),("positions","last_observed_bar_ts","INTEGER NOT NULL DEFAULT 0"),("positions","sl1_hit","INTEGER NOT NULL DEFAULT 0"),("live_orders","allocator_json","TEXT NOT NULL DEFAULT '{}'"),("live_orders","entry_price","REAL NOT NULL DEFAULT 0"),("live_orders","notional","REAL NOT NULL DEFAULT 0"),("live_orders","leverage","REAL NOT NULL DEFAULT 1")]:
+            migrations=[
+                ("strategy_state","live_manual_enabled","INTEGER NOT NULL DEFAULT 0"),("strategy_state","signal_tf","TEXT NOT NULL DEFAULT '15m'"),("challengers","domain","TEXT NOT NULL DEFAULT 'entry'"),
+                ("signals","signal_tf","TEXT NOT NULL DEFAULT '15m'"),("signals","bar_ts","INTEGER NOT NULL DEFAULT 0"),
+                ("positions","signal_tf","TEXT NOT NULL DEFAULT '15m'"),("positions","signal_bar_ts","INTEGER NOT NULL DEFAULT 0"),("positions","params_json","TEXT NOT NULL DEFAULT '{}'"),("positions","last_observed_bar_ts","INTEGER NOT NULL DEFAULT 0"),
+                ("positions","sl1_hit","INTEGER NOT NULL DEFAULT 0"),("positions","tp1_hit","INTEGER NOT NULL DEFAULT 0"),("positions","tp2_hit","INTEGER NOT NULL DEFAULT 0"),("positions","max_favorable","REAL NOT NULL DEFAULT 0"),("positions","min_favorable","REAL NOT NULL DEFAULT 0"),
+                ("live_orders","allocator_json","TEXT NOT NULL DEFAULT '{}'"),("live_orders","entry_price","REAL NOT NULL DEFAULT 0"),("live_orders","notional","REAL NOT NULL DEFAULT 0"),("live_orders","leverage","REAL NOT NULL DEFAULT 1")
+            ]
+            for table,name,ddl in migrations:
                 try:self._add_col(table,name,ddl)
                 except Exception:pass
             self.conn.commit()
+    def _ensure_identity(self):
+        ident=self.runtime_get("db_identity","")
+        if not ident:
+            ident=f"db-{int(time.time())}-{uuid.uuid4().hex[:10]}";self.runtime_set("db_identity",ident)
+        boots=int(self.runtime_get("db_boot_count","0") or 0)+1;self.runtime_set("db_boot_count",boots)
+        self.runtime_set("db_last_opened_at",self.opened_at)
+        if self.was_missing:self.event("DB_FILE_CREATED",f"database file was missing at process start; created {self.path}","WARN")
     def execute(self,sql,args=()):
         with self.lock:c=self.conn.execute(sql,args);self.conn.commit();return c
     def query(self,sql,args=())->list[dict[str,Any]]:
@@ -79,14 +94,23 @@ class DB:
     def log_adjustment(self,strategy,kind,before,after,reason,accepted):self.execute("INSERT INTO adjustments(strategy,kind,before_json,after_json,reason,accepted,created_at) VALUES(?,?,?,?,?,?,?)",(strategy,kind,json.dumps(before),json.dumps(after),reason,int(accepted),int(time.time()*1000)))
     def risk_event(self,code,detail,strategy=None,variant=None,symbol=None):self.execute("INSERT INTO risk_events(strategy,variant,symbol,code,detail,created_at) VALUES(?,?,?,?,?,?)",(strategy,variant,symbol,code,detail,int(time.time()*1000)))
     def event(self,kind,detail,level="INFO"):self.execute("INSERT INTO system_events(level,kind,detail,created_at) VALUES(?,?,?,?)",(level,kind,detail,int(time.time()*1000)))
+    def diagnostics(self):
+        counts={}
+        for table in ["strategy_state","signals","positions","trades","post_trade_studies","adjustments","challengers","strategy_accounts","risk_events","live_orders","live_protections"]:
+            try:counts[table]=int((self.one(f"SELECT COUNT(*)n FROM {table}") or {"n":0})["n"])
+            except Exception:counts[table]=None
+        try:size=os.path.getsize(self.path)
+        except Exception:size=0
+        research_rows=sum(int(counts.get(k) or 0) for k in ["signals","positions","trades","post_trade_studies","adjustments","challengers"])
+        return {"exists":os.path.exists(self.path),"file_size":size,"was_missing_at_boot":self.was_missing,"opened_at":self.opened_at,"identity":self.runtime_get("db_identity","unknown"),"boot_count":int(self.runtime_get("db_boot_count","0") or 0),"research_model_version":self.runtime_get("research_model_version",""),"research_rows":research_rows,"counts":counts}
     def reset_research_epoch(self,specs,version):
-        if self.runtime_get("research_model_version","")==version:return False
-        now=int(time.time()*1000)
-        for table in ["signals","positions","trades","trade_path_bars","post_trade_studies","adjustments","challengers","strategy_eval_bars","strategy_accounts"]:
-            try:self.execute(f"DELETE FROM {table}")
-            except Exception:pass
-        for s in specs:
-            self.execute("INSERT INTO strategy_state(strategy,display_name,description,stage,params_json,live_eligible,live_manual_enabled,enabled,signal_tf,evidence_since,updated_at) VALUES(?,?,?,?,?,0,0,1,?,?,?) ON CONFLICT(strategy) DO UPDATE SET display_name=excluded.display_name,description=excluded.description,stage='EARLY',params_json=excluded.params_json,live_eligible=0,live_manual_enabled=0,enabled=1,signal_tf=excluded.signal_tf,final_since=NULL,evidence_since=excluded.evidence_since,updated_at=excluded.updated_at",(s.name,s.display_name,s.description,"EARLY",json.dumps(s.params),s.signal_tf,now,now));self.ensure_account(s.name,"champion",reset=True)
-        self.runtime_set("research_model_version",version);self.event("RESEARCH_EPOCH_RESET",f"reset to {version}; incompatible paper evidence excluded","WARN");return True
+        old=self.runtime_get("research_model_version","")
+        if old==version:return False
+        # IMPORTANT: version transitions are now NON-DESTRUCTIVE. We preserve all paper evidence and accounts.
+        # New strategies are created by ensure_strategy(). If a future migration truly requires discarding evidence,
+        # it must be an explicit/manual migration with a backup, never an automatic startup DELETE.
+        self.runtime_set("research_model_version",version)
+        self.event("RESEARCH_MODEL_VERSION_CHANGED",f"{old or 'unset'} -> {version}; preserved all paper evidence (non-destructive)","WARN")
+        return True
 
 db=DB(settings.db_path)
