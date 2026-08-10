@@ -16,23 +16,38 @@ jobs:
           python-version: '3.12'
           cache: pip
       - run: pip install -r requirements.txt
+
       - name: Compile Python
         run: python -m compileall -q app
+
       - name: Check frontend JS syntax
         run: node --check static/app.js
-      - name: Import and API smoke
+
+      - name: Scanner must not block on private Bitget I/O
+        run: |
+          ! grep -q "await live_adapter.reconcile" app/engine.py
+          ! grep -q "await live_adapter.sync_from_paper_for_symbol" app/engine.py
+          grep -q "live_adapter.queue_symbol_sync" app/engine.py
+          grep -q "live_adapter.queue_entry" app/engine.py
+
+      - name: Import, persistence and exchange-normalization smoke
         env:
           DB_PATH: /tmp/crypto-lab-ci.db
           LIVE_TRADING_ALLOWED: 'false'
           COINGLASS_ENABLED: 'false'
           DISCORD_DAILY_REPORT_ENABLED: 'false'
           HISTORICAL_REPLAY_ENABLED: 'false'
+          BITGET_API_KEY: ''
+          BITGET_API_SECRET: ''
+          BITGET_PASSPHRASE: ''
         run: |
           rm -f /tmp/crypto-lab-ci.db /tmp/crypto-lab-ci.db-shm /tmp/crypto-lab-ci.db-wal
           python - <<'PY'
+          import asyncio
           import time
           import app.main as m
           from app.db import db
+          from app.live import live_adapter
           from app.strategies import SPECS
 
           assert len(SPECS) == 12, len(SPECS)
@@ -43,6 +58,7 @@ jobs:
           assert isinstance(m.signals(5), list)
           assert isinstance(m.post_trade(5), list)
           assert isinstance(m.storage_status(), dict)
+          assert isinstance(m.live_jobs(5), list)
 
           # Regression: model-version transitions must NEVER erase paper evidence automatically.
           now=int(time.time()*1000)
@@ -52,5 +68,34 @@ jobs:
           db.reset_research_epoch(SPECS,'ci-new-version')
           after=(db.one("SELECT COUNT(*) n FROM signals") or {'n':0})['n']
           assert after == before, (before,after)
-          print('smoke ok', m.storage_status())
+
+          # Exchange precision regression: never increase a risk-sized order just to meet Bitget minimums.
+          live_adapter.contract_cache={
+              'TESTUSDT':{
+                  'symbol':'TESTUSDT','symbolStatus':'normal','symbolType':'perpetual',
+                  'supportMarginCoins':['USDT'],'volumePlace':'3','sizeMultiplier':'0.001',
+                  'pricePlace':'2','priceEndStep':'1','minTradeNum':'0.001',
+                  'minTradeUSDT':'5','maxMarketOrderQty':'100','minLever':'1','maxLever':'50'
+              }
+          }
+          live_adapter.contract_cache_at=time.time()
+
+          async def check_exchange_math():
+              qty,lev,_=await live_adapter.normalize_qty('TESTUSDT',0.1239,100,4.9)
+              assert qty == '0.123', qty
+              assert lev == 4.0, lev
+              price=await live_adapter.normalize_price('TESTUSDT',123.456)
+              assert price == '123.46', price
+              try:
+                  await live_adapter.normalize_qty('TESTUSDT',0.001,100,3)
+              except PermissionError:
+                  pass
+              else:
+                  raise AssertionError('below-minimum risk-sized order was incorrectly upsized')
+
+          asyncio.run(check_exchange_math())
+          assert live_adapter._hold_side('long') == 'buy'
+          assert live_adapter._hold_side('short') == 'sell'
+          assert (db.one("SELECT COUNT(*) n FROM sqlite_master WHERE type='table' AND name='live_execution_jobs'") or {'n':0})['n'] == 1
+          print('smoke ok', m.storage_status(), live_adapter.gate_status())
           PY

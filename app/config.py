@@ -43,6 +43,10 @@ class Settings:
 
     scan_interval_sec: int = _i("SCAN_INTERVAL_SEC",30)
     scan_symbols_per_cycle: int = _i("SCAN_SYMBOLS_PER_CYCLE",36)
+    scan_concurrency: int = _i("SCAN_CONCURRENCY",3)
+    market_requests_per_second: float = _f("MARKET_REQUESTS_PER_SECOND",15.0)
+    market_max_concurrency: int = _i("MARKET_MAX_CONCURRENCY",6)
+    market_retry_attempts: int = _i("MARKET_RETRY_ATTEMPTS",3)
     universe_min_usdt_volume: float = _f("UNIVERSE_MIN_USDT_VOLUME",1_500_000)
     universe_max_symbols: int = _i("UNIVERSE_MAX_SYMBOLS",280)
     min_symbol_age_days: int = _i("MIN_SYMBOL_AGE_DAYS",3)
@@ -96,6 +100,12 @@ class Settings:
     bitget_api_key: str = os.getenv("BITGET_API_KEY","")
     bitget_api_secret: str = os.getenv("BITGET_API_SECRET","")
     bitget_passphrase: str = os.getenv("BITGET_PASSPHRASE","")
+    bitget_request_timeout_sec: float = _f("BITGET_REQUEST_TIMEOUT_SEC",12.0)
+    bitget_requests_per_second: float = _f("BITGET_REQUESTS_PER_SECOND",5.0)
+    bitget_max_concurrency: int = _i("BITGET_MAX_CONCURRENCY",3)
+    bitget_retry_attempts: int = _i("BITGET_RETRY_ATTEMPTS",4)
+    bitget_circuit_failure_threshold: int = _i("BITGET_CIRCUIT_FAILURE_THRESHOLD",6)
+    bitget_circuit_recovery_sec: int = _i("BITGET_CIRCUIT_RECOVERY_SEC",20)
 
     live_trading_allowed: bool = _b("LIVE_TRADING_ALLOWED",False)
     live_partial_tp_enabled: bool = _b("LIVE_PARTIAL_TP_ENABLED",True)
@@ -112,6 +122,9 @@ class Settings:
     live_protection_verify_sec: int = _i("LIVE_PROTECTION_VERIFY_SEC",20)
     live_emergency_close_on_protection_failure: bool = _b("LIVE_EMERGENCY_CLOSE_ON_PROTECTION_FAILURE",True)
     live_trail_sync_enabled: bool = _b("LIVE_TRAIL_SYNC_ENABLED",True)
+    live_entry_queue_max: int = _i("LIVE_ENTRY_QUEUE_MAX",256)
+    live_entry_job_max_age_sec: int = _i("LIVE_ENTRY_JOB_MAX_AGE_SEC",180)
+    live_max_open_safety_ratio: float = _f("LIVE_MAX_OPEN_SAFETY_RATIO",0.98)
 
     coinglass_enabled: bool = _b("COINGLASS_ENABLED",True)
     coinglass_api_key: str = os.getenv("COINGLASS_API_KEY","")
