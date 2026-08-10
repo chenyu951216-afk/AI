@@ -16,7 +16,7 @@ from .ai_hunter import ai_hunter
 from .daily_report import daily_reporter
 from .historical_replay import historical_replay
 
-app=FastAPI(title="AI Crypto Strategy Lab",version="2026.08.08-daily-report-historical-replay")
+app=FastAPI(title="AI Crypto Strategy Lab",version="2026.08.10-storage-safe-refresh")
 app.mount("/static",StaticFiles(directory=os.path.join(os.path.dirname(os.path.dirname(__file__)),"static")),name="static")
 @app.on_event("startup")
 async def startup():
@@ -50,7 +50,7 @@ def position_rows():
 def home():return open(os.path.join(os.path.dirname(os.path.dirname(__file__)),"templates","index.html"),encoding="utf-8").read()
 @app.get("/api/overview")
 def overview():
-    now=int(time.time()*1000);day=now-86400000;p=(db.one("SELECT COALESCE(SUM(net_pnl),0)x FROM trades WHERE variant='champion' AND closed_at>=?",(day,)) or {"x":0})["x"];reg=db.one("SELECT * FROM regime_history ORDER BY ts DESC LIMIT 1");cg=market.cg.health();return {"running":engine.running,"last_scan":engine.last_scan,"last_error":engine.last_error,"scan_count":engine.scan_count,"universe_size":len(engine.universe),"strategy_count":len(SPEC_MAP),"daily_realized_pnl":round(float(p),2),"coinglass_connected":cg["ok"],"coinglass":cg,"macro":reg or {"regime":"NEUTRAL"},"live":live_adapter.gate_status(),"daily_report":daily_reporter.status(),"historical_replay":historical_replay.status()}
+    now=int(time.time()*1000);day=now-86400000;p=(db.one("SELECT COALESCE(SUM(net_pnl),0)x FROM trades WHERE variant='champion' AND closed_at>=?",(day,)) or {"x":0})["x"];reg=db.one("SELECT * FROM regime_history ORDER BY ts DESC LIMIT 1");cg=market.cg.health();return {"running":engine.running,"last_scan":engine.last_scan,"last_error":engine.last_error,"scan_count":engine.scan_count,"universe_size":len(engine.universe),"strategy_count":len(SPEC_MAP),"daily_realized_pnl":round(float(p),2),"coinglass_connected":cg["ok"],"coinglass":cg,"macro":reg or {"regime":"NEUTRAL"},"live":live_adapter.gate_status(),"daily_report":daily_reporter.status(),"historical_replay":historical_replay.status(),"storage":db.diagnostics()}
 @app.get("/api/strategies")
 def strategies():return strategy_rows()
 @app.get("/api/positions")
@@ -72,6 +72,8 @@ def live_protections(limit:int=200):return db.query("SELECT p.*,o.strategy,o.sym
 @app.get("/api/live/status")
 def live_status():
     x=live_adapter.gate_status();x.update({"last_reconcile":int(live_adapter.last_sync*1000) if live_adapter.last_sync else None,"reconcile_error":live_adapter.last_sync_error,"exchange_positions":len(live_adapter.last_positions)});return x
+@app.get("/api/storage-status")
+def storage_status():return db.diagnostics()
 @app.get("/api/ai-hunter/status")
 def ai_hunter_status():return ai_hunter.status()
 @app.get("/api/daily-report/status")
@@ -118,6 +120,6 @@ def strategy_live_toggle(name:str,body:Toggle,r:Request):
     if body.enabled and (s["stage"]!="FINAL" or not s["live_eligible"] or not s["enabled"]):raise HTTPException(409,"Only enabled FINAL/live-eligible strategies can be manually approved")
     db.update_strategy(name,live_manual_enabled=body.enabled);db.event("STRATEGY_LIVE_APPROVAL",f"{name} -> {body.enabled}","WARN" if body.enabled else "INFO");return {"strategy":name,"live_manual_enabled":body.enabled}
 @app.get("/api/config/public")
-def public_config():return {"scan_interval_sec":settings.scan_interval_sec,"initial_paper_equity":settings.initial_paper_equity,"closed_candle_safety_ms":settings.closed_candle_safety_ms,"post_trade_follow_bars":settings.post_trade_follow_bars,"live_trading_allowed":settings.live_trading_allowed,"live_base_risk_pct":settings.live_base_risk_pct,"live_max_total_notional_multiple":settings.live_max_total_notional_multiple,"admin_token_configured":bool(settings.admin_token),"bitget_credentials_configured":live_adapter.credentials_ready(),"coinglass":market.cg.health(),"ai_hunter":ai_hunter.status(),"daily_report":{"enabled":settings.discord_daily_report_enabled,"configured":bool(settings.discord_webhook_url),"hour":settings.daily_report_hour,"minute":settings.daily_report_minute,"timezone":settings.timezone},"historical_replay":historical_replay.status()}
+def public_config():return {"scan_interval_sec":settings.scan_interval_sec,"initial_paper_equity":settings.initial_paper_equity,"closed_candle_safety_ms":settings.closed_candle_safety_ms,"post_trade_follow_bars":settings.post_trade_follow_bars,"live_trading_allowed":settings.live_trading_allowed,"live_base_risk_pct":settings.live_base_risk_pct,"live_max_total_notional_multiple":settings.live_max_total_notional_multiple,"admin_token_configured":bool(settings.admin_token),"bitget_credentials_configured":live_adapter.credentials_ready(),"coinglass":market.cg.health(),"ai_hunter":ai_hunter.status(),"daily_report":{"enabled":settings.discord_daily_report_enabled,"configured":bool(settings.discord_webhook_url),"hour":settings.daily_report_hour,"minute":settings.daily_report_minute,"timezone":settings.timezone},"historical_replay":historical_replay.status(),"storage":db.diagnostics()}
 @app.get("/health")
-def health():return {"ok":True,"time":int(time.time()*1000),"engine":engine.running,"last_error":engine.last_error,"coinglass":market.cg.health(),"ai_hunter_ready":ai_hunter.status()["ready"],"daily_report":daily_reporter.status(),"historical_replay":historical_replay.status()}
+def health():return {"ok":True,"time":int(time.time()*1000),"engine":engine.running,"last_error":engine.last_error,"coinglass":market.cg.health(),"ai_hunter_ready":ai_hunter.status()["ready"],"daily_report":daily_reporter.status(),"historical_replay":historical_replay.status(),"storage":db.diagnostics()}
